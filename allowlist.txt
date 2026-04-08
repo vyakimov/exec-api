@@ -1,0 +1,8 @@
+# Commands the exec-api server is allowed to run.
+# One command name per line. Lines starting with # are ignored.
+cat
+ls
+echo
+date
+grep
+find
