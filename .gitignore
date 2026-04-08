@@ -2,5 +2,7 @@ __pycache__/
 *.pyc
 venv/
 bin/
+logs/
+.env
 allowlist.txt
 command-paths.json

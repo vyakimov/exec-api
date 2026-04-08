@@ -33,18 +33,22 @@ EXEC_API_TOKEN=your-secret-token uvicorn server:app --host 127.0.0.1 --port 8019
 To install as a persistent launchd service:
 
 ```bash
-EXEC_API_TOKEN=your-secret-token ./install-launchd.sh --host 127.0.0.1 --port 8019
+cp .env.example .env
+# Edit .env — set EXEC_API_TOKEN and any extra env vars your commands need
+
+./install-launchd.sh --host 127.0.0.1 --port 8019
 ```
 
-This creates a venv (if needed), generates a plist, and loads the service. Options:
+The script reads all `KEY=VALUE` pairs from `.env` and injects them into the launchd plist as environment variables. Options:
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--host` | `127.0.0.1` | Bind address |
 | `--port` | `8019` | Bind port |
 | `--label` | `exec-api` | launchd service label |
+| `--env-file` | `.env` (in repo dir) | Path to env file |
 
-After installation, add any extra env vars your commands need to the plist and restart:
+To update after changing `.env`, re-run the script or:
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/exec-api
@@ -54,9 +58,9 @@ launchctl kickstart -k gui/$(id -u)/exec-api
 
 | File / Env Var | Purpose |
 |---|---|
-| `allowlist.txt` | One command name per line. `#` comments and blank lines are ignored. Gitignored — copy from `allowlist.txt.example` to get started. |
+| `allowlist.txt` | One command name per line. `#` comments and blank lines are ignored. Gitignored — copy from `allowlist.txt.example`. |
 | `command-paths.json` | Optional `{"command": "/path"}` map for commands that should not be resolved from `$PATH`. Gitignored — copy from `command-paths.json.example`. |
-| `EXEC_API_TOKEN` | Required. Bearer token for server authentication. |
+| `.env` | `KEY=VALUE` pairs passed to the service via `install-launchd.sh`. Must contain `EXEC_API_TOKEN`. Gitignored — copy from `.env.example`. |
 
 ## Client
 
