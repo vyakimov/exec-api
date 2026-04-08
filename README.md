@@ -17,7 +17,8 @@ A minimal HTTP server that executes allowlisted commands with bearer-token auth.
 pip install -r requirements.txt
 
 # Configure the allowlist (edit to suit your deployment)
-cat allowlist.txt
+cp allowlist.txt.example allowlist.txt
+# Edit allowlist.txt as needed
 
 # Optional: map commands to specific paths instead of $PATH lookup
 cp command-paths.json.example command-paths.json
@@ -31,8 +32,8 @@ EXEC_API_TOKEN=your-secret-token uvicorn server:app --host 127.0.0.1 --port 8019
 
 | File / Env Var | Purpose |
 |---|---|
-| `allowlist.txt` | One command name per line. `#` comments and blank lines are ignored. |
-| `command-paths.json` | Optional `{"command": "/path"}` map for commands that should not be resolved from `$PATH`. Gitignored. |
+| `allowlist.txt` | One command name per line. `#` comments and blank lines are ignored. Gitignored — copy from `allowlist.txt.example` to get started. |
+| `command-paths.json` | Optional `{"command": "/path"}` map for commands that should not be resolved from `$PATH`. Gitignored — copy from `command-paths.json.example`. |
 | `EXEC_API_TOKEN` | Required. Bearer token for server authentication. |
 
 ## Client

@@ -10,8 +10,8 @@ This repo contains a minimal HTTP server that executes allowlisted commands with
 
 ## Configuration
 
-- `allowlist.txt` — one command name per line, `#` comments. Loaded at startup into a frozen set.
-- `command-paths.json` — optional `{"command": "/absolute/path"}` map for commands that should not be resolved from `$PATH`. Gitignored because it contains deployment-specific paths.
+- `allowlist.txt` — one command name per line, `#` comments. Loaded at startup into a frozen set. Gitignored — copy from `allowlist.txt.example` to get started.
+- `command-paths.json` — optional `{"command": "/absolute/path"}` map for commands that should not be resolved from `$PATH`. Gitignored — copy from `command-paths.json.example`.
 - `EXEC_API_TOKEN` — required env var for the server. Bearer token for authentication.
 
 ## Core Security Properties
