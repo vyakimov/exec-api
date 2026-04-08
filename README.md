@@ -28,6 +28,28 @@ cp command-paths.json.example command-paths.json
 EXEC_API_TOKEN=your-secret-token uvicorn server:app --host 127.0.0.1 --port 8019
 ```
 
+### macOS launchd service
+
+To install as a persistent launchd service:
+
+```bash
+EXEC_API_TOKEN=your-secret-token ./install-launchd.sh --host 127.0.0.1 --port 8019
+```
+
+This creates a venv (if needed), generates a plist, and loads the service. Options:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--host` | `127.0.0.1` | Bind address |
+| `--port` | `8019` | Bind port |
+| `--label` | `exec-api` | launchd service label |
+
+After installation, add any extra env vars your commands need to the plist and restart:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/exec-api
+```
+
 ## Configuration
 
 | File / Env Var | Purpose |
