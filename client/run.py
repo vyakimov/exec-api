@@ -135,11 +135,15 @@ def load_input_file(json_mode, file_path):
     }
 
 
-def parse_json_request(json_mode):
-    """Read a JSON request object from stdin and return (command, args, body)."""
-    raw = sys.stdin.read()
+def parse_json_request(json_mode, raw=None):
+    """Parse a JSON request and return (command, args, body).
+
+    If raw is None, reads from stdin.
+    """
+    if raw is None:
+        raw = sys.stdin.read()
     if not raw.strip():
-        emit_error(json_mode, "--json-request requires a JSON object on stdin")
+        emit_error(json_mode, "--json-request requires a JSON object")
     try:
         req = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -184,6 +188,7 @@ def main():
     argv = sys.argv[1:]
     json_mode = False
     json_request = False
+    json_request_file = None
     retries = 0
     retry_on = "transport"
     stdin_mode = "auto"
@@ -196,6 +201,12 @@ def main():
         elif flag == "--json-request":
             json_request = True
             json_mode = True  # --json-request implies --json
+        elif flag == "--json-request-file":
+            if not argv:
+                emit_error(json_mode, "--json-request-file requires a path")
+            json_request_file = argv.pop(0)
+            json_request = True
+            json_mode = True
         elif flag == "--retry":
             if not argv:
                 emit_error(json_mode, "--retry requires a number")
@@ -229,20 +240,29 @@ def main():
             emit_error(json_mode, f"unknown flag: {flag}")
 
     if json_request:
-        # --json-request mode: read structured JSON from stdin
+        # --json-request / --json-request-file mode
         if argv:
             emit_error(json_mode, "--json-request cannot be combined with positional command/args")
         if files:
             emit_error(json_mode, "--json-request cannot be combined with --file")
         if stdin_mode != "auto":
             emit_error(json_mode, "--json-request cannot be combined with --stdin/--no-stdin")
-        command, args, body = parse_json_request(json_mode)
+        raw = None
+        if json_request_file is not None:
+            if not os.path.isfile(json_request_file):
+                emit_error(json_mode, f"file not found: {json_request_file}")
+            try:
+                with open(json_request_file) as fh:
+                    raw = fh.read()
+            except OSError as exc:
+                emit_error(json_mode, f"failed to read request file: {exc}")
+        command, args, body = parse_json_request(json_mode, raw)
     else:
         if len(argv) < 1:
             emit_error(
                 json_mode,
-                "usage: run.py [--json] [--json-request] [--retry N] "
-                "[--retry-on transport|any] [--stdin auto|always|never|--no-stdin] "
+                "usage: run.py [--json] [--json-request] [--json-request-file PATH] "
+                "[--retry N] [--retry-on transport|any] [--stdin auto|always|never|--no-stdin] "
                 "[--file PATH ...] <command> [args...]",
             )
         command = argv[0]

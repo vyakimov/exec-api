@@ -96,6 +96,9 @@ client/exec-api --json --file ./data.csv mycommand @file:data.csv
 
 # Structured JSON request on stdin
 echo '{"command":"echo","argv":["hello"]}' | client/exec-api --json-request
+
+# Structured JSON request from a file (useful when stdin is unavailable)
+client/exec-api --json-request-file request.json
 ```
 
 ### JSON Envelope
