@@ -1,31 +1,46 @@
 # exec-api
 
-A minimal HTTP server that executes allowlisted commands with bearer-token auth. Includes a stdlib-only Python client.
+**Run allowlisted shell commands on a remote host, over HTTP, with JSON in and JSON out.**
+
+Built for LLM harnesses. Your agent runs on one machine; the tools it needs (compilers, CLIs, scripts, build systems) live on another. exec-api lets the harness reach across that gap safely: every invocation is a single JSON request, every result is a structured JSON envelope — easy to parse, easy to log, impossible to confuse with normal shell output.
+
+## Why use this
+
+- **Remote execution for agents.** Run an LLM loop in one environment and execute its commands in another (different OS, different network, dedicated sandbox VM) without giving it shell access.
+- **JSON in, JSON out.** Commands are wrapped in JSON so a model can construct them reliably and a harness can parse the result without regex-scraping stdout/stderr.
+- **Safe by default.** Frozen allowlist, no shell interpolation, bearer-token auth, timeouts, file-size caps. The agent can only do what you've explicitly permitted.
+- **Tiny.** A single FastAPI server and a stdlib-only Python client. No queue, no database, no plugin system.
 
 ## Security Model
 
-- **Frozen allowlist** — only commands listed in `allowlist.txt` can run. The set is loaded once at startup.
-- **No shell execution** — commands run via `subprocess.exec` with an argument list, never through a shell.
-- **Bearer-token auth** — every request must include a valid token (constant-time comparison).
-- **Timeouts** — 30-second limit per command.
-- **File uploads** — basename-only validation, size limits (5 MiB per file, 10 MiB total), per-request temp directories with guaranteed cleanup.
-- **Stdin limits** — optional UTF-8 stdin forwarding capped at 256 KiB.
+- **Frozen allowlist** — only commands in `allowlist.txt` can run. Loaded once at startup.
+- **No shell execution** — `subprocess.exec` with an argv list. No `sh -c`, no interpolation, no injection surface.
+- **Bearer-token auth** — every request requires a token (constant-time comparison).
+- **Timeouts** — 30 seconds per command.
+- **File uploads** — basename-only validation, 5 MiB per file, 10 MiB total, per-request temp dir with guaranteed cleanup.
+- **Stdin limits** — optional UTF-8 stdin forwarding, capped at 256 KiB.
 
 ## Quick Start
 
 ```bash
 pip install -r requirements.txt
 
-# Configure the allowlist (edit to suit your deployment)
+# Define what the agent is allowed to run
 cp allowlist.txt.example allowlist.txt
-# Edit allowlist.txt as needed
+# Edit allowlist.txt
 
-# Optional: map commands to specific paths instead of $PATH lookup
+# Optional: pin commands to absolute paths instead of $PATH lookup
 cp command-paths.json.example command-paths.json
-# Edit command-paths.json as needed
 
 # Start the server
 EXEC_API_TOKEN=your-secret-token uvicorn server:app --host 127.0.0.1 --port 8019
+```
+
+Then from your harness host:
+
+```bash
+EXEC_API_HOST=remote-box:8019 EXEC_API_TOKEN=your-secret-token \
+  client/exec-api --json echo hello
 ```
 
 ### macOS launchd service
@@ -39,7 +54,7 @@ cp .env.example .env
 ./install-launchd.sh --host 127.0.0.1 --port 8019
 ```
 
-The script reads all `KEY=VALUE` pairs from `.env` and injects them into the launchd plist as environment variables. Options:
+The script reads all `KEY=VALUE` pairs from `.env` and injects them into the launchd plist. Options:
 
 | Flag | Default | Purpose |
 |---|---|---|
@@ -48,7 +63,7 @@ The script reads all `KEY=VALUE` pairs from `.env` and injects them into the lau
 | `--label` | `exec-api` | launchd service label |
 | `--env-file` | `.env` (in repo dir) | Path to env file |
 
-To update after changing `.env`, re-run the script or:
+To update after editing `.env`:
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/exec-api
@@ -58,13 +73,13 @@ launchctl kickstart -k gui/$(id -u)/exec-api
 
 | File / Env Var | Purpose |
 |---|---|
-| `allowlist.txt` | One command name per line. `#` comments and blank lines are ignored. Gitignored — copy from `allowlist.txt.example`. |
+| `allowlist.txt` | One command name per line. `#` comments and blank lines ignored. Gitignored — copy from `allowlist.txt.example`. |
 | `command-paths.json` | Optional `{"command": "/path"}` map for commands that should not be resolved from `$PATH`. Gitignored — copy from `command-paths.json.example`. |
 | `.env` | `KEY=VALUE` pairs passed to the service via `install-launchd.sh`. Must contain `EXEC_API_TOKEN`. Gitignored — copy from `.env.example`. |
 
 ## Client
 
-The `client/` directory contains a stdlib-only Python client (no dependencies beyond Python 3).
+The `client/` directory contains a stdlib-only Python client (Python 3, no dependencies). Drop it onto the harness host and call it directly.
 
 ### Environment Variables
 
@@ -94,7 +109,7 @@ echo "input" | client/exec-api --json cat
 # Upload files
 client/exec-api --json --file ./data.csv mycommand @file:data.csv
 
-# Structured JSON request on stdin
+# Structured JSON request on stdin (the agent-friendly path)
 echo '{"command":"echo","argv":["hello"]}' | client/exec-api --json-request
 
 # Structured JSON request from a file (useful when stdin is unavailable)
@@ -103,7 +118,7 @@ client/exec-api --json-request-file request.json
 
 ### JSON Envelope
 
-In `--json` mode, output is a JSON object:
+In `--json` mode, output is a JSON object — the same shape every time, success or failure, so the harness has exactly one parser to write:
 
 ```json
 {
