@@ -13,6 +13,7 @@ This repo contains a minimal HTTP server that executes allowlisted commands with
 - `allowlist.txt` — one command name per line, `#` comments. Loaded at startup into a frozen set. Gitignored — copy from `allowlist.txt.example` to get started.
 - `command-paths.json` — optional `{"command": "/absolute/path"}` map for commands that should not be resolved from `$PATH`. Gitignored — copy from `command-paths.json.example`.
 - `EXEC_API_TOKEN` — required env var for the server. Bearer token for authentication.
+- `EXEC_API_READ_PREFIXES` — optional colon-separated list of absolute path prefixes that `/read-file` is allowed to read under. Defaults to `$HOME`. Resolved at startup with symlinks followed.
 
 ## Core Security Properties
 
@@ -24,6 +25,7 @@ Any change that weakens these properties is security-sensitive:
 - 30-second command timeout.
 - Optional UTF-8 stdin forwarding with a 256 KiB limit.
 - File uploads use strict basename-only validation, per-request temp directories, size limits, and cleanup after execution.
+- `/read-file` resolves the requested path (following symlinks) and rejects anything not under `EXEC_API_READ_PREFIXES` (defaults to `$HOME`). Size is capped at 10 MiB.
 - `exec_ms` (server-side execution time) is part of the response contract.
 
 ## Change Guidelines

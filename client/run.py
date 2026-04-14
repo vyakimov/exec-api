@@ -91,6 +91,61 @@ def do_request(url, payload, command, args):
     ), result
 
 
+def do_read_file_request(url, payload, path):
+    """Execute one /read-file request. Returns (envelope_dict, raw_result_or_None)."""
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {TOKEN}",
+        },
+        method="POST",
+    )
+
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=35) as resp:
+            result = json.loads(resp.read())
+        elapsed = round((time.monotonic() - t0) * 1000)
+    except urllib.error.HTTPError as e:
+        elapsed = round((time.monotonic() - t0) * 1000)
+        body = e.read().decode(errors="replace")
+        return build_envelope(
+            ok=False,
+            error_type="request",
+            command=["read-file", path],
+            detail=f"HTTP {e.code}: {body}",
+            timing_total_ms=elapsed,
+        ), None
+    except (urllib.error.URLError, OSError) as e:
+        elapsed = round((time.monotonic() - t0) * 1000)
+        reason = getattr(e, "reason", str(e))
+        return build_envelope(
+            ok=False,
+            error_type="transport",
+            command=["read-file", path],
+            detail=f"cannot reach exec API at {HOST}: {reason}",
+            timing_total_ms=elapsed,
+        ), None
+
+    envelope = build_envelope(
+        ok=True,
+        command=["read-file", path],
+        exit_code=0,
+        timing_total_ms=elapsed,
+        timing_exec_ms=result.get("exec_ms"),
+    )
+    envelope["file"] = {
+        "name": result.get("name"),
+        "path": result.get("path"),
+        "size": result.get("size"),
+        "mime": result.get("mime"),
+        "content_base64": result.get("content_base64"),
+    }
+    return envelope, result
+
+
 def should_retry(envelope, retry_on):
     """Return True if this envelope's error type is retriable."""
     et = envelope.get("error_type")
@@ -193,6 +248,7 @@ def main():
     retry_on = "transport"
     stdin_mode = "auto"
     files = []
+    read_file_path = None
 
     while argv and argv[0].startswith("--"):
         flag = argv.pop(0)
@@ -234,10 +290,61 @@ def main():
             if not argv:
                 emit_error(json_mode, "--file requires a local path")
             files.append(load_input_file(json_mode, argv.pop(0)))
+        elif flag == "--read-file":
+            if not argv:
+                emit_error(json_mode, "--read-file requires a remote path")
+            read_file_path = argv.pop(0)
         elif flag == "--":
             break
         else:
             emit_error(json_mode, f"unknown flag: {flag}")
+
+    if read_file_path is not None:
+        if argv:
+            emit_error(json_mode, "--read-file cannot be combined with positional command/args")
+        if files:
+            emit_error(json_mode, "--read-file cannot be combined with --file")
+        if json_request:
+            emit_error(json_mode, "--read-file cannot be combined with --json-request")
+        if stdin_mode != "auto":
+            emit_error(json_mode, "--read-file cannot be combined with --stdin/--no-stdin")
+        if not TOKEN:
+            emit_error(json_mode, "EXEC_API_TOKEN not set")
+
+        url = f"http://{HOST}/read-file"
+        payload = json.dumps({"path": read_file_path}).encode()
+        max_attempts = 1 + retries
+        envelope = None
+        result = None
+        for attempt in range(max_attempts):
+            envelope, result = do_read_file_request(url, payload, read_file_path)
+            if envelope["ok"] or attempt == max_attempts - 1:
+                break
+            if not should_retry(envelope, retry_on):
+                break
+            if not json_mode:
+                print(
+                    f"retry {attempt + 1}/{retries}: {envelope.get('error_type')} error, retrying...",
+                    file=sys.stderr,
+                )
+            backoff_sleep(attempt)
+
+        if json_mode:
+            envelope["attempts"] = attempt + 1
+            print(json.dumps(envelope))
+            sys.exit(0)
+
+        if result is None:
+            print(f"error: {envelope.get('detail', 'unknown error')}", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            raw_bytes = base64.b64decode(result["content_base64"], validate=True)
+        except (KeyError, ValueError) as exc:
+            print(f"error: invalid response: {exc}", file=sys.stderr)
+            sys.exit(1)
+        sys.stdout.buffer.write(raw_bytes)
+        sys.exit(0)
 
     if json_request:
         # --json-request / --json-request-file mode
@@ -263,7 +370,7 @@ def main():
                 json_mode,
                 "usage: run.py [--json] [--json-request] [--json-request-file PATH] "
                 "[--retry N] [--retry-on transport|any] [--stdin auto|always|never|--no-stdin] "
-                "[--file PATH ...] <command> [args...]",
+                "[--file PATH ...] [--read-file REMOTE_PATH] <command> [args...]",
             )
         command = argv[0]
         args = argv[1:]

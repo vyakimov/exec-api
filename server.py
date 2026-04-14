@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hmac
 import logging
+import mimetypes
 import os
 import shutil
 import sys
@@ -42,6 +43,33 @@ FILES_TOTAL_MAX_BYTES = 10 * 1024 * 1024  # 10 MiB
 FILENAME_MAX_CHARS = 128
 FILE_PLACEHOLDER_PREFIX = "@file:"
 FILESDIR_PLACEHOLDER = "@filesdir"
+
+READ_FILE_MAX_BYTES = 10 * 1024 * 1024  # 10 MiB
+
+
+def _load_read_prefixes() -> tuple[Path, ...]:
+    raw = os.environ.get("EXEC_API_READ_PREFIXES", "").strip()
+    if raw:
+        candidates = [p for p in raw.split(":") if p]
+    else:
+        home = os.environ.get("HOME", "").strip()
+        if not home:
+            print("FATAL: HOME not set and EXEC_API_READ_PREFIXES not configured", file=sys.stderr)
+            sys.exit(1)
+        candidates = [home]
+    resolved: list[Path] = []
+    for c in candidates:
+        try:
+            resolved.append(Path(c).expanduser().resolve(strict=True))
+        except (OSError, RuntimeError) as exc:
+            print(f"warning: read prefix '{c}' unavailable: {exc}", file=sys.stderr)
+    if not resolved:
+        print("FATAL: no usable read-file prefixes", file=sys.stderr)
+        sys.exit(1)
+    return tuple(resolved)
+
+
+READ_FILE_PREFIXES: tuple[Path, ...] = _load_read_prefixes()
 
 def _load_command_paths() -> dict[str, str]:
     path = Path(__file__).resolve().parent / "command-paths.json"
@@ -94,6 +122,10 @@ class InputFile(BaseModel):
         if value in {".", ".."}:
             raise ValueError("file name must not be '.' or '..'")
         return value
+
+
+class ReadFileRequest(BaseModel):
+    path: str = Field(min_length=1)
 
 
 class RunRequest(BaseModel):
@@ -207,12 +239,72 @@ def inject_file_args(
     return injected_args
 
 
-@app.post("/run")
-async def run_command(req: RunRequest, authorization: str = Header()):
-    # Auth check (constant-time compare)
+def _check_auth(authorization: str) -> None:
     token = authorization.removeprefix("Bearer ").strip()
     if not hmac.compare_digest(token, API_TOKEN):
         raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def _resolve_under_prefix(raw_path: str) -> Path:
+    try:
+        resolved = Path(raw_path).expanduser().resolve(strict=True)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="file not found")
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid path: {exc}") from exc
+    for prefix in READ_FILE_PREFIXES:
+        try:
+            resolved.relative_to(prefix)
+        except ValueError:
+            continue
+        return resolved
+    raise HTTPException(status_code=403, detail="path outside allowed prefixes")
+
+
+@app.post("/read-file")
+async def read_file(req: ReadFileRequest, authorization: str = Header()):
+    _check_auth(authorization)
+
+    resolved = _resolve_under_prefix(req.path)
+    if not resolved.is_file():
+        raise HTTPException(status_code=400, detail="path is not a regular file")
+
+    try:
+        size = resolved.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"stat failed: {exc}") from exc
+    if size > READ_FILE_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"file too large ({size} bytes, max {READ_FILE_MAX_BYTES})",
+        )
+
+    t0 = time.monotonic()
+    try:
+        content = resolved.read_bytes()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"read failed: {exc}") from exc
+    exec_ms = round((time.monotonic() - t0) * 1000)
+
+    mime, _ = mimetypes.guess_type(resolved.name)
+
+    logger.info(
+        "read_file path=%s size=%s exec_ms=%s", resolved, len(content), exec_ms
+    )
+
+    return {
+        "name": resolved.name,
+        "path": str(resolved),
+        "size": len(content),
+        "mime": mime,
+        "content_base64": base64.b64encode(content).decode("ascii"),
+        "exec_ms": exec_ms,
+    }
+
+
+@app.post("/run")
+async def run_command(req: RunRequest, authorization: str = Header()):
+    _check_auth(authorization)
 
     # Allowlist check
     if req.command not in COMMAND_PATHS:

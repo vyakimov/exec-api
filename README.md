@@ -9,6 +9,7 @@ A minimal HTTP server that executes allowlisted commands with bearer-token auth.
 - **Bearer-token auth** — every request must include a valid token (constant-time comparison).
 - **Timeouts** — 30-second limit per command.
 - **File uploads** — basename-only validation, size limits (5 MiB per file, 10 MiB total), per-request temp directories with guaranteed cleanup.
+- **File reads** — `/read-file` returns base64 contents of a single file. Paths must resolve (following symlinks) under an allowlisted prefix; defaults to `$HOME`, overridable via `EXEC_API_READ_PREFIXES` (colon-separated). Capped at 10 MiB.
 - **Stdin limits** — optional UTF-8 stdin forwarding capped at 256 KiB.
 
 ## Quick Start
@@ -153,3 +154,28 @@ In `--json` mode, output is a JSON object:
 ```
 
 All fields except `command` are optional. Files are staged in a per-request temp directory and cleaned up after execution. Use `@file:<name>` or `@file:<index>` placeholders in `args` to reference uploaded files, or they are appended automatically.
+
+### `POST /read-file`
+
+Returns the contents of a single file as base64. Intended for pulling remote artifacts (images, PDFs, logs) back to the caller.
+
+**Request:**
+
+```json
+{"path": "/Users/someone/screenshot.png"}
+```
+
+**Response:**
+
+```json
+{
+  "name": "screenshot.png",
+  "path": "/Users/someone/screenshot.png",
+  "size": 48213,
+  "mime": "image/png",
+  "content_base64": "...",
+  "exec_ms": 3
+}
+```
+
+The path is resolved (symlinks followed) and must fall under an allowlisted prefix. Configure prefixes via `EXEC_API_READ_PREFIXES` (colon-separated absolute paths); if unset, defaults to `$HOME`. Files larger than 10 MiB are rejected with HTTP 413.
