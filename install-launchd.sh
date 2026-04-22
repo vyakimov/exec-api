@@ -115,6 +115,17 @@ mkdir -p "$LOG_DIR"
 if launchctl list "$LABEL" >/dev/null 2>&1; then
     echo "Unloading existing service..."
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    # bootout is async; bootstrap racing teardown returns errno 5 ("Input/output error").
+    # Poll until the service is fully gone (max ~5s).
+    i=0
+    while launchctl list "$LABEL" >/dev/null 2>&1; do
+        i=$((i + 1))
+        if [ "$i" -ge 10 ]; then
+            echo "warning: service still present after 5s; continuing" >&2
+            break
+        fi
+        sleep 0.5
+    done
 fi
 
 # Generate plist
