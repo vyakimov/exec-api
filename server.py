@@ -7,6 +7,7 @@ import logging
 import mimetypes
 import os
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -49,14 +50,14 @@ READ_FILE_MAX_BYTES = 10 * 1024 * 1024  # 10 MiB
 
 def _load_read_prefixes() -> tuple[Path, ...]:
     raw = os.environ.get("EXEC_API_READ_PREFIXES", "").strip()
-    if raw:
-        candidates = [p for p in raw.split(":") if p]
-    else:
-        home = os.environ.get("HOME", "").strip()
-        if not home:
-            print("FATAL: HOME not set and EXEC_API_READ_PREFIXES not configured", file=sys.stderr)
-            sys.exit(1)
-        candidates = [home]
+    if not raw:
+        print(
+            "FATAL: EXEC_API_READ_PREFIXES not set. Set it to a colon-separated "
+            "list of absolute path prefixes that /read-file may read under.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    candidates = [p for p in raw.split(":") if p]
     resolved: list[Path] = []
     for c in candidates:
         try:
@@ -357,12 +358,19 @@ async def run_command(req: RunRequest, authorization: str = Header()):
             stdin=asyncio.subprocess.PIPE if stdin_bytes is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(input=stdin_bytes), timeout=COMMAND_TIMEOUT
         )
     except asyncio.TimeoutError:
-        proc.kill()
+        # Kill the whole process group so children spawned by the command
+        # (e.g. via xargs/make) don't outlive the request.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        await proc.wait()
         raise HTTPException(status_code=408, detail="command timed out")
     finally:
         if temp_dir is not None:

@@ -1,8 +1,15 @@
 # Commands the exec-api server is allowed to run.
 # One command name per line. Lines starting with # are ignored.
+#
+# WARNING: the allowlist only checks the top-level binary. Args are passed
+# through unfiltered, so any binary that can spawn other binaries is a full
+# bypass of this allowlist. Do NOT add commands like:
+#   find (-exec), xargs, awk (system()), make, git (-c, aliases, hooks),
+#   python/node/perl/ruby and other interpreters, vim/less/man (!cmd shell-out),
+#   ssh (ProxyCommand), tar (--use-compress-program), env, nice, time.
+# See the "Allowlist hazards" section in README.md.
 cat
 ls
 echo
 date
 grep
-find
