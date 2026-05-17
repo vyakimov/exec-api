@@ -18,8 +18,26 @@ Built for LLM harnesses. Your agent runs on one machine; the tools it needs (com
 - **Bearer-token auth** — every request requires a token (constant-time comparison).
 - **Timeouts** — 30 seconds per command.
 - **File uploads** — basename-only validation, 5 MiB per file, 10 MiB total, per-request temp dir with guaranteed cleanup.
-- **File reads** — `/read-file` returns base64 contents of a single file. Paths must resolve (following symlinks) under an allowlisted prefix; defaults to `$HOME`, overridable via `EXEC_API_READ_PREFIXES` (colon-separated). Capped at 10 MiB.
+- **File reads** — `/read-file` returns base64 contents of a single file. Paths must resolve (following symlinks) under a prefix in `EXEC_API_READ_PREFIXES` (required, colon-separated). Capped at 10 MiB.
 - **Stdin limits** — optional UTF-8 stdin forwarding, capped at 256 KiB.
+
+## Allowlist hazards
+
+The allowlist only checks the **top-level binary**. Arguments are passed through unfiltered, and there is no shell, but a binary that can itself spawn other binaries defeats the allowlist entirely. Treat the allowlist as "what this binary can do," not "what command runs."
+
+Do **not** allowlist binaries that can execute arbitrary programs, including:
+
+- `find` — `-exec` / `-execdir` run any binary
+- `xargs`, `env`, `nice`, `nohup`, `time`, `timeout`, `parallel` — run a named program
+- `awk` (`system()`), GNU `sed` (`e` command), `make` — shell out
+- `git` — `-c core.sshCommand=…`, aliases, and hooks execute code
+- `python`, `node`, `perl`, `ruby`, `bash`, `sh` and other interpreters
+- `vim`, `less`, `man`, `gdb` — `!cmd` shell escapes
+- `ssh` (`ProxyCommand`), `tar` (`--use-compress-program`), `rsync` (`-e`)
+
+If you need one of these, run exec-api in a dedicated sandbox VM where breaking out of the allowlist has no consequences — the allowlist alone will not contain it.
+
+The `/read-file` prefixes deserve the same scrutiny: anything under `EXEC_API_READ_PREFIXES` is readable by anyone with the token. Keep the prefixes narrow; avoid broad ones like `$HOME`, which expose `~/.ssh`, `~/.aws`, browser profiles, and keychains.
 
 ## Quick Start
 
@@ -33,8 +51,9 @@ cp allowlist.txt.example allowlist.txt
 # Optional: pin commands to absolute paths instead of $PATH lookup
 cp command-paths.json.example command-paths.json
 
-# Start the server
-EXEC_API_TOKEN=your-secret-token uvicorn server:app --host 127.0.0.1 --port 8019
+# Start the server (EXEC_API_READ_PREFIXES is required — see Configuration)
+EXEC_API_TOKEN=your-secret-token EXEC_API_READ_PREFIXES=/path/to/artifacts \
+  uvicorn server:app --host 127.0.0.1 --port 8019
 ```
 
 Then from your harness host:
@@ -50,7 +69,7 @@ To install as a persistent launchd service:
 
 ```bash
 cp .env.example .env
-# Edit .env — set EXEC_API_TOKEN and any extra env vars your commands need
+# Edit .env — set EXEC_API_TOKEN, EXEC_API_READ_PREFIXES, and any extra env vars
 
 ./install-launchd.sh --host 127.0.0.1 --port 8019
 ```
@@ -76,7 +95,7 @@ launchctl kickstart -k gui/$(id -u)/exec-api
 |---|---|
 | `allowlist.txt` | One command name per line. `#` comments and blank lines ignored. Gitignored — copy from `allowlist.txt.example`. |
 | `command-paths.json` | Optional `{"command": "/path"}` map for commands that should not be resolved from `$PATH`. Gitignored — copy from `command-paths.json.example`. |
-| `.env` | `KEY=VALUE` pairs passed to the service via `install-launchd.sh`. Must contain `EXEC_API_TOKEN`. Gitignored — copy from `.env.example`. |
+| `.env` | `KEY=VALUE` pairs passed to the service via `install-launchd.sh`. Must contain `EXEC_API_TOKEN` and `EXEC_API_READ_PREFIXES`. Gitignored — copy from `.env.example`. |
 
 ## Client
 
@@ -193,4 +212,4 @@ Returns the contents of a single file as base64. Intended for pulling remote art
 }
 ```
 
-The path is resolved (symlinks followed) and must fall under an allowlisted prefix. Configure prefixes via `EXEC_API_READ_PREFIXES` (colon-separated absolute paths); if unset, defaults to `$HOME`. Files larger than 10 MiB are rejected with HTTP 413.
+The path is resolved (symlinks followed) and must fall under an allowlisted prefix. Prefixes are set via `EXEC_API_READ_PREFIXES` (required, colon-separated absolute paths); the server refuses to start if it is unset. Files larger than 10 MiB are rejected with HTTP 413.
