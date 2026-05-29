@@ -13,47 +13,63 @@ Built for LLM harnesses. Your agent runs on one machine; the tools it needs (com
 
 ## Security Model
 
-- **Frozen allowlist** — only commands in `allowlist.txt` can run. Loaded once at startup.
-- **No shell execution** — `subprocess.exec` with an argv list. No `sh -c`, no interpolation, no injection surface.
+**Operations are the boundary.** Filesystem access goes through policy-checked
+operations — `/read-file`, `/write-file`, `/copy-uploaded-file`, `/search-files`,
+`/list-dir` — each validated against the prefixes in `config.yaml`. The binary
+allowlist (`/run`) is only a last line of defense.
+
+- **Policy-checked filesystem ops** — every read/write/list/search resolves the
+  path (following symlinks) and checks it against `read_prefixes` / `write_prefixes`.
+  Raw file tools (`cat`, `grep`, `rg`, `fd`, `find`, `ls`) are **not** allowlisted —
+  use the operations instead, so the prefixes actually mean something.
+- **Writes are safe-by-default** — atomic create-or-replace, no-clobber `create`
+  mode, size caps, and a symlinked final target is rejected unless
+  `allow_symlink_final_target` is set.
+- **Binary allowlist** — only commands marked `allowed: true` in `config.yaml` run.
+- **Hard denylist** — code-execution-capable binaries (osascript, ssh, scp, rsync,
+  interpreters, `find`, `xargs`, `make`, `git`, …) are refused at load even if a
+  config marks them allowed. They can never run.
+- **No shell execution** — `subprocess.exec` with an argv list. No `sh -c`, no
+  interpolation, no injection surface. `search-files` passes the query positionally
+  after `--`.
 - **Bearer-token auth** — every request requires a token (constant-time comparison).
-- **Timeouts** — 30 seconds per command.
-- **File uploads** — basename-only validation, 5 MiB per file, 10 MiB total, per-request temp dir with guaranteed cleanup.
-- **File reads** — `/read-file` returns base64 contents of a single file. Paths must resolve (following symlinks) under a prefix in `EXEC_API_READ_PREFIXES` (required, colon-separated). Capped at 10 MiB.
+- **Timeouts** — 30 seconds per command/search.
+- **File uploads** — basename-only validation, 5 MiB per file, 10 MiB total,
+  per-request temp dir with guaranteed cleanup.
 - **Stdin limits** — optional UTF-8 stdin forwarding, capped at 256 KiB.
 
 ## Allowlist hazards
 
 The allowlist only checks the **top-level binary**. Arguments are passed through unfiltered, and there is no shell, but a binary that can itself spawn other binaries defeats the allowlist entirely. Treat the allowlist as "what this binary can do," not "what command runs."
 
-Do **not** allowlist binaries that can execute arbitrary programs, including:
+A built-in **hard denylist** refuses these at load even if `config.yaml` marks them
+`allowed: true`, but the categories are worth knowing — do not rely on the denylist
+being exhaustive:
 
-- `find` — `-exec` / `-execdir` run any binary
+- `find`, `fd` — `-exec` / `-x` run any binary
 - `xargs`, `env`, `nice`, `nohup`, `time`, `timeout`, `parallel` — run a named program
 - `awk` (`system()`), GNU `sed` (`e` command), `make` — shell out
 - `git` — `-c core.sshCommand=…`, aliases, and hooks execute code
 - `python`, `node`, `perl`, `ruby`, `bash`, `sh` and other interpreters
 - `vim`, `less`, `man`, `gdb` — `!cmd` shell escapes
-- `ssh` (`ProxyCommand`), `tar` (`--use-compress-program`), `rsync` (`-e`)
+- `ssh` (`ProxyCommand`), `tar` (`--use-compress-program`), `rsync` (`-e`), `scp`
+- `osascript` — arbitrary macOS automation
 
 If you need one of these, run exec-api in a dedicated sandbox VM where breaking out of the allowlist has no consequences — the allowlist alone will not contain it.
 
-The `/read-file` prefixes deserve the same scrutiny: anything under `EXEC_API_READ_PREFIXES` is readable by anyone with the token. Keep the prefixes narrow; avoid broad ones like `$HOME`, which expose `~/.ssh`, `~/.aws`, browser profiles, and keychains.
+The filesystem prefixes deserve the same scrutiny: anything under `read_prefixes` is readable, and anything under `write_prefixes` is writable, by anyone with the token. Keep them narrow; avoid broad ones like `$HOME`, which expose `~/.ssh`, `~/.aws`, browser profiles, and keychains.
 
 ## Quick Start
 
 ```bash
 pip install -r requirements.txt
 
-# Define what the agent is allowed to run
-cp allowlist.txt.example allowlist.txt
-# Edit allowlist.txt
+# Define the policy: filesystem prefixes, operation toggles, command allowlist
+cp config.yaml.example config.yaml
+# Edit config.yaml
 
-# Optional: pin commands to absolute paths instead of $PATH lookup
-cp command-paths.json.example command-paths.json
-
-# Start the server (EXEC_API_READ_PREFIXES is required — see Configuration)
-EXEC_API_TOKEN=your-secret-token EXEC_API_READ_PREFIXES=/path/to/artifacts \
-  uvicorn server:app --host 127.0.0.1 --port 8019
+# Start the server (EXEC_API_TOKEN is the only required env var)
+EXEC_API_TOKEN=your-secret-token uvicorn server:app --host 127.0.0.1 --port 8019
 ```
 
 Then from your harness host:
@@ -68,8 +84,8 @@ EXEC_API_HOST=remote-box:8019 EXEC_API_TOKEN=your-secret-token \
 To install as a persistent launchd service:
 
 ```bash
-cp .env.example .env
-# Edit .env — set EXEC_API_TOKEN, EXEC_API_READ_PREFIXES, and any extra env vars
+cp config.yaml.example config.yaml   # edit: prefixes, operations, commands
+cp .env.example .env                 # edit: set EXEC_API_TOKEN and any CLI secrets
 
 ./install-launchd.sh --host 127.0.0.1 --port 8019
 ```
@@ -93,9 +109,31 @@ launchctl kickstart -k gui/$(id -u)/exec-api
 
 | File / Env Var | Purpose |
 |---|---|
-| `allowlist.txt` | One command name per line. `#` comments and blank lines ignored. Gitignored — copy from `allowlist.txt.example`. |
-| `command-paths.json` | Optional `{"command": "/path"}` map for commands that should not be resolved from `$PATH`. Gitignored — copy from `command-paths.json.example`. |
-| `.env` | `KEY=VALUE` pairs passed to the service via `install-launchd.sh`. Must contain `EXEC_API_TOKEN` and `EXEC_API_READ_PREFIXES`. Gitignored — copy from `.env.example`. |
+| `config.yaml` | Filesystem prefixes/limits, operation toggles, and the command allowlist (with optional `executable` paths). The security boundary. Gitignored — copy from `config.yaml.example`. |
+| `.env` | `KEY=VALUE` pairs passed to the service via `install-launchd.sh`. Must contain `EXEC_API_TOKEN`; holds CLI secrets. Gitignored — copy from `.env.example`. |
+
+### `config.yaml`
+
+```yaml
+filesystem:
+  read_prefixes:  [/Users/vy/Desktop, /Users/vy/Downloads]   # read/list/search
+  write_prefixes: [/Users/vy/Downloads, /tmp]                # write/copy
+  max_read_bytes: 10485760
+  max_write_bytes: 10485760
+  allow_symlink_final_target: false   # reject writing through a symlink
+
+operations:                            # toggle endpoints; disabled -> 404
+  read_file: true
+  write_file: true
+  copy_uploaded_file: true
+  search_files: true
+  list_dir: true
+
+commands:                              # /run allowlist (last line of defense)
+  bearctl: { allowed: true, executable: /opt/homebrew/bin/bearctl }
+  ping:    { allowed: true }
+  osascript: { allowed: false }        # also blocked by the hard denylist
+```
 
 ## Client
 
@@ -128,6 +166,14 @@ echo "input" | client/exec-api --json cat
 
 # Upload files
 client/exec-api --json --file ./data.csv mycommand @file:data.csv
+
+# Filesystem operations
+client/exec-api --read-file /allowed/path/file.txt > local.txt
+echo "contents" | client/exec-api --write-file /allowed/path/out.txt   # create (default)
+echo "more"     | client/exec-api --write-file /allowed/path/out.txt --mode overwrite
+client/exec-api --copy-file ./local.bin /allowed/path/remote.bin
+client/exec-api --search /allowed/path "needle" --ignore-case
+client/exec-api --list-dir /allowed/path
 
 # Structured JSON request on stdin (the agent-friendly path)
 echo '{"command":"echo","argv":["hello"]}' | client/exec-api --json-request
@@ -212,4 +258,68 @@ Returns the contents of a single file as base64. Intended for pulling remote art
 }
 ```
 
-The path is resolved (symlinks followed) and must fall under an allowlisted prefix. Prefixes are set via `EXEC_API_READ_PREFIXES` (required, colon-separated absolute paths); the server refuses to start if it is unset. Files larger than 10 MiB are rejected with HTTP 413.
+The path is resolved (symlinks followed) and must fall under a `read_prefixes` entry in `config.yaml`. Files larger than `max_read_bytes` are rejected with HTTP 413.
+
+### `POST /write-file`
+
+Writes a small file atomically under a `write_prefixes` entry.
+
+**Request:**
+
+```json
+{
+  "path": "/Users/vy/Downloads/foo.txt",
+  "content_base64": "...",
+  "mode": "create",
+  "mkdirs": false,
+  "expected_sha256": "optional"
+}
+```
+
+`mode` is `create` (default; fails with 409 if the file exists), `overwrite`
+(atomic replace), or `append`. The destination is canonicalized (the deepest
+existing ancestor is symlink-resolved); a symlinked final target is rejected
+unless `allow_symlink_final_target` is set. Content over `max_write_bytes` → 413.
+If `expected_sha256` is supplied and does not match the content hash → 400.
+
+**Response:** `{"path", "size", "sha256", "created", "exec_ms"}`.
+
+### `POST /copy-uploaded-file`
+
+Stages an uploaded file and places it at a destination under `write_prefixes`,
+using the same write rules as `/write-file`.
+
+**Request:**
+
+```json
+{
+  "file": "@file:0",
+  "dest": "/Users/vy/Downloads/foo.bin",
+  "mode": "create",
+  "files": [{"name": "foo.bin", "content_base64": "..."}]
+}
+```
+
+`file` references one staged upload by `@file:<index>` / `@file:<name>` (or bare
+`0` / name). **Response:** `{"path", "size", "sha256", "created", "exec_ms"}`.
+
+### `POST /search-files`
+
+Searches under a `read_prefixes` directory (uses `rg` internally; falls back to a
+Python walk). Arbitrary `rg` flags are **not** exposed.
+
+**Request:**
+
+```json
+{"root": "/allowed/path", "query": "needle", "ignore_case": false, "fixed_strings": false, "glob": "*.py", "max_results": 1000}
+```
+
+**Response:** `{"root", "matches": [{"path", "line", "text"}], "truncated", "engine", "exec_ms"}`.
+
+### `POST /list-dir`
+
+Lists a single directory (non-recursive) under a `read_prefixes` entry.
+
+**Request:** `{"path": "/allowed/path"}`
+
+**Response:** `{"path", "entries": [{"name", "type", "size", "mtime"}], "truncated", "exec_ms"}`.

@@ -1,0 +1,64 @@
+# exec-api configuration.
+#
+# This file is the security boundary for exec-api. Operations (read/write/list/
+# search) are checked against the filesystem prefixes below; the binary allowlist
+# under `commands` is only a last line of defense.
+#
+# Copy to config.yaml (gitignored) and edit. EXEC_API_TOKEN stays in the
+# environment / .env — secrets do not belong in this file.
+
+filesystem:
+  # Absolute path prefixes that read_file / list_dir / search_files may touch.
+  # Resolved at startup with symlinks followed. Keep narrow — anything under a
+  # read prefix is readable by anyone with the token. Avoid broad prefixes like
+  # $HOME, which expose ~/.ssh, ~/.aws, browser profiles, keychains, etc.
+  read_prefixes:
+    - /Users/vy/Desktop
+    - /Users/vy/Downloads
+  # Absolute path prefixes that write_file / copy_uploaded_file may write under.
+  write_prefixes:
+    - /Users/vy/Downloads
+    - /tmp
+  max_read_bytes: 10485760   # 10 MiB
+  max_write_bytes: 10485760  # 10 MiB
+  # When false (default), writing to a path whose final component is a symlink is
+  # rejected. Reads/list/search always resolve symlinks before the prefix check.
+  allow_symlink_final_target: false
+
+# Toggle individual operations on/off. A disabled operation returns 404.
+operations:
+  read_file: true
+  write_file: true
+  copy_uploaded_file: true
+  search_files: true
+  list_dir: true
+
+# Binary allowlist (last line of defense — NOT the real boundary). Only commands
+# with `allowed: true` can run via /run. `executable` pins an absolute path;
+# otherwise the command is resolved from $PATH.
+#
+# A built-in hard denylist (osascript, ssh, scp, rsync, find, interpreters, …)
+# is refused even if listed with allowed: true. See README "Allowlist hazards".
+commands:
+  luxctl:  { allowed: true, executable: /Users/vy/openclaw/luxctl/luxctl }
+  bearctl: { allowed: true, executable: /Users/vy/openclaw/bearctl/bearctl }
+  huckctl: { allowed: true, executable: /Users/vy/openclaw/huckctl/huckctl }
+  duectl:  { allowed: true, executable: /Users/vy/openclaw/duectl/duectl }
+  beeper-desktop-cli: { allowed: true }
+  gog: { allowed: true }
+  td: { allowed: true }
+  remindctl: { allowed: true }
+  memo: { allowed: true }
+  goplaces: { allowed: true }
+  accli: { allowed: true }
+  ping: { allowed: true }
+
+  # Superseded by policy-aware operations. Listed here for documentation; the
+  # `replacement` field is informational only.
+  cat:  { allowed: false, replacement: read_file }
+  ls:   { allowed: false, replacement: list_dir }
+  grep: { allowed: false, replacement: search_files }
+  rg:   { allowed: false, replacement: search_files }
+  fd:   { allowed: false, replacement: search_files }
+  find: { allowed: false, replacement: list_dir }
+  osascript: { allowed: false }
