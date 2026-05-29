@@ -146,6 +146,59 @@ def do_read_file_request(url, payload, path):
     return envelope, result
 
 
+def do_op_request(url, payload, label):
+    """Execute one request to a filesystem-operation endpoint.
+
+    Returns (envelope_dict, raw_result_or_None). The raw server response is
+    attached to the envelope under "result" on success.
+    """
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {TOKEN}",
+        },
+        method="POST",
+    )
+
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=35) as resp:
+            result = json.loads(resp.read())
+        elapsed = round((time.monotonic() - t0) * 1000)
+    except urllib.error.HTTPError as e:
+        elapsed = round((time.monotonic() - t0) * 1000)
+        body = e.read().decode(errors="replace")
+        return build_envelope(
+            ok=False,
+            error_type="request",
+            command=label,
+            detail=f"HTTP {e.code}: {body}",
+            timing_total_ms=elapsed,
+        ), None
+    except (urllib.error.URLError, OSError) as e:
+        elapsed = round((time.monotonic() - t0) * 1000)
+        reason = getattr(e, "reason", str(e))
+        return build_envelope(
+            ok=False,
+            error_type="transport",
+            command=label,
+            detail=f"cannot reach exec API at {HOST}: {reason}",
+            timing_total_ms=elapsed,
+        ), None
+
+    envelope = build_envelope(
+        ok=True,
+        command=label,
+        exit_code=0,
+        timing_total_ms=elapsed,
+        timing_exec_ms=result.get("exec_ms"),
+    )
+    envelope["result"] = result
+    return envelope, result
+
+
 def should_retry(envelope, retry_on):
     """Return True if this envelope's error type is retriable."""
     et = envelope.get("error_type")
@@ -238,6 +291,28 @@ def parse_json_request(json_mode, raw=None):
     return command, argv_field, body
 
 
+def run_with_retries(request_fn, retries, retry_on, json_mode):
+    """Call request_fn() up to 1+retries times with backoff. Returns (envelope, result)."""
+    max_attempts = 1 + retries
+    envelope = None
+    result = None
+    attempt = 0
+    for attempt in range(max_attempts):
+        envelope, result = request_fn()
+        if envelope["ok"] or attempt == max_attempts - 1:
+            break
+        if not should_retry(envelope, retry_on):
+            break
+        if not json_mode:
+            print(
+                f"retry {attempt + 1}/{retries}: {envelope.get('error_type')} error, retrying...",
+                file=sys.stderr,
+            )
+        backoff_sleep(attempt)
+    envelope["attempts"] = attempt + 1
+    return envelope, result
+
+
 def main():
     # Parse wrapper flags before the command name
     argv = sys.argv[1:]
@@ -249,6 +324,17 @@ def main():
     stdin_mode = "auto"
     files = []
     read_file_path = None
+    write_file_dest = None
+    copy_local = None
+    copy_dest = None
+    search_root = None
+    search_query = None
+    list_dir_path = None
+    op_mode = "create"
+    mkdirs = False
+    glob = None
+    ignore_case = False
+    fixed_strings = False
 
     while argv and argv[0].startswith("--"):
         flag = argv.pop(0)
@@ -294,43 +380,123 @@ def main():
             if not argv:
                 emit_error(json_mode, "--read-file requires a remote path")
             read_file_path = argv.pop(0)
+        elif flag == "--write-file":
+            if not argv:
+                emit_error(json_mode, "--write-file requires a remote dest path")
+            write_file_dest = argv.pop(0)
+        elif flag == "--copy-file":
+            if len(argv) < 2:
+                emit_error(json_mode, "--copy-file requires LOCAL and DEST paths")
+            copy_local = argv.pop(0)
+            copy_dest = argv.pop(0)
+        elif flag == "--search":
+            if len(argv) < 2:
+                emit_error(json_mode, "--search requires REMOTE_ROOT and QUERY")
+            search_root = argv.pop(0)
+            search_query = argv.pop(0)
+        elif flag == "--list-dir":
+            if not argv:
+                emit_error(json_mode, "--list-dir requires a remote path")
+            list_dir_path = argv.pop(0)
+        elif flag == "--mode":
+            if not argv:
+                emit_error(json_mode, "--mode requires one of: create, overwrite, append")
+            op_mode = argv.pop(0)
+            if op_mode not in ("create", "overwrite", "append"):
+                emit_error(json_mode, "--mode must be one of: create, overwrite, append")
+        elif flag == "--mkdirs":
+            mkdirs = True
+        elif flag == "--glob":
+            if not argv:
+                emit_error(json_mode, "--glob requires a pattern")
+            glob = argv.pop(0)
+        elif flag == "--ignore-case":
+            ignore_case = True
+        elif flag == "--fixed-strings":
+            fixed_strings = True
         elif flag == "--":
             break
         else:
             emit_error(json_mode, f"unknown flag: {flag}")
 
-    if read_file_path is not None:
+    # --- Filesystem operation modes (mutually exclusive with each other, with
+    # --json-request, and with positional command/args) ---
+    fs_modes = [
+        ("--read-file", read_file_path is not None),
+        ("--write-file", write_file_dest is not None),
+        ("--copy-file", copy_local is not None),
+        ("--search", search_root is not None),
+        ("--list-dir", list_dir_path is not None),
+    ]
+    active = [name for name, on in fs_modes if on]
+    if len(active) > 1:
+        emit_error(json_mode, f"these flags are mutually exclusive: {', '.join(active)}")
+
+    if active:
+        mode_name = active[0]
         if argv:
-            emit_error(json_mode, "--read-file cannot be combined with positional command/args")
-        if files:
-            emit_error(json_mode, "--read-file cannot be combined with --file")
+            emit_error(json_mode, f"{mode_name} cannot be combined with positional command/args")
         if json_request:
-            emit_error(json_mode, "--read-file cannot be combined with --json-request")
-        if stdin_mode != "auto":
-            emit_error(json_mode, "--read-file cannot be combined with --stdin/--no-stdin")
+            emit_error(json_mode, f"{mode_name} cannot be combined with --json-request")
+        if mode_name != "--copy-file" and files:
+            emit_error(json_mode, f"{mode_name} cannot be combined with --file")
         if not TOKEN:
             emit_error(json_mode, "EXEC_API_TOKEN not set")
 
-        url = f"http://{HOST}/read-file"
-        payload = json.dumps({"path": read_file_path}).encode()
-        max_attempts = 1 + retries
-        envelope = None
-        result = None
-        for attempt in range(max_attempts):
-            envelope, result = do_read_file_request(url, payload, read_file_path)
-            if envelope["ok"] or attempt == max_attempts - 1:
-                break
-            if not should_retry(envelope, retry_on):
-                break
-            if not json_mode:
-                print(
-                    f"retry {attempt + 1}/{retries}: {envelope.get('error_type')} error, retrying...",
-                    file=sys.stderr,
-                )
-            backoff_sleep(attempt)
+        if mode_name == "--read-file":
+            payload = json.dumps({"path": read_file_path}).encode()
+            req_fn = lambda: do_read_file_request(  # noqa: E731
+                f"http://{HOST}/read-file", payload, read_file_path
+            )
+        elif mode_name == "--write-file":
+            content = b"" if sys.stdin.isatty() else sys.stdin.buffer.read()
+            payload = json.dumps({
+                "path": write_file_dest,
+                "content_base64": base64.b64encode(content).decode(),
+                "mode": op_mode,
+                "mkdirs": mkdirs,
+            }).encode()
+            label = ["write-file", write_file_dest]
+            req_fn = lambda: do_op_request(  # noqa: E731
+                f"http://{HOST}/write-file", payload, label
+            )
+        elif mode_name == "--copy-file":
+            upload = load_input_file(json_mode, copy_local)
+            payload = json.dumps({
+                "file": "@file:0",
+                "dest": copy_dest,
+                "mode": op_mode,
+                "mkdirs": mkdirs,
+                "files": [upload],
+            }).encode()
+            label = ["copy-file", copy_local, copy_dest]
+            req_fn = lambda: do_op_request(  # noqa: E731
+                f"http://{HOST}/copy-uploaded-file", payload, label
+            )
+        elif mode_name == "--search":
+            search_body = {
+                "root": search_root,
+                "query": search_query,
+                "ignore_case": ignore_case,
+                "fixed_strings": fixed_strings,
+            }
+            if glob:
+                search_body["glob"] = glob
+            payload = json.dumps(search_body).encode()
+            label = ["search", search_root, search_query]
+            req_fn = lambda: do_op_request(  # noqa: E731
+                f"http://{HOST}/search-files", payload, label
+            )
+        else:  # --list-dir
+            payload = json.dumps({"path": list_dir_path}).encode()
+            label = ["list-dir", list_dir_path]
+            req_fn = lambda: do_op_request(  # noqa: E731
+                f"http://{HOST}/list-dir", payload, label
+            )
+
+        envelope, result = run_with_retries(req_fn, retries, retry_on, json_mode)
 
         if json_mode:
-            envelope["attempts"] = attempt + 1
             print(json.dumps(envelope))
             sys.exit(0)
 
@@ -338,12 +504,32 @@ def main():
             print(f"error: {envelope.get('detail', 'unknown error')}", file=sys.stderr)
             sys.exit(1)
 
-        try:
-            raw_bytes = base64.b64decode(result["content_base64"], validate=True)
-        except (KeyError, ValueError) as exc:
-            print(f"error: invalid response: {exc}", file=sys.stderr)
-            sys.exit(1)
-        sys.stdout.buffer.write(raw_bytes)
+        if mode_name == "--read-file":
+            try:
+                raw_bytes = base64.b64decode(result["content_base64"], validate=True)
+            except (KeyError, ValueError) as exc:
+                print(f"error: invalid response: {exc}", file=sys.stderr)
+                sys.exit(1)
+            sys.stdout.buffer.write(raw_bytes)
+        elif mode_name in ("--write-file", "--copy-file"):
+            verb = "created" if result.get("created") else "wrote"
+            print(
+                f"{verb} {result.get('path')} ({result.get('size')} bytes, "
+                f"sha256 {str(result.get('sha256'))[:12]})"
+            )
+        elif mode_name == "--search":
+            for m in result.get("matches", []):
+                if m.get("path") is not None:
+                    print(f"{m['path']}:{m.get('line')}:{m.get('text')}")
+                else:
+                    print(m.get("text", ""))
+            if result.get("truncated"):
+                print("(results truncated)", file=sys.stderr)
+        else:  # --list-dir
+            for e in result.get("entries", []):
+                print(f"{e.get('type', '?')[0]}\t{e.get('size'):>10}\t{e.get('name')}")
+            if result.get("truncated"):
+                print("(listing truncated)", file=sys.stderr)
         sys.exit(0)
 
     if json_request:
@@ -370,7 +556,10 @@ def main():
                 json_mode,
                 "usage: run.py [--json] [--json-request] [--json-request-file PATH] "
                 "[--retry N] [--retry-on transport|any] [--stdin auto|always|never|--no-stdin] "
-                "[--file PATH ...] [--read-file REMOTE_PATH] <command> [args...]",
+                "[--file PATH ...] [--read-file REMOTE_PATH] [--write-file DEST] "
+                "[--copy-file LOCAL DEST] [--search ROOT QUERY] [--list-dir PATH] "
+                "[--mode create|overwrite|append] [--mkdirs] [--glob PAT] "
+                "[--ignore-case] [--fixed-strings] <command> [args...]",
             )
         command = argv[0]
         args = argv[1:]

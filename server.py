@@ -1,11 +1,20 @@
-"""exec-api — runs allowlisted commands over HTTP with bearer-token auth."""
+"""exec-api — policy-checked filesystem operations and allowlisted commands over HTTP.
+
+Operations (read/write/list/search) are the security boundary: every filesystem
+touch goes through can_read/can_write/can_list, which check resolved paths against
+the prefixes in config.yaml. The binary allowlist under `commands` is only a last
+line of defense, backed by a hard denylist of code-execution-capable binaries.
+"""
 
 import asyncio
 import base64
+import fnmatch
+import hashlib
 import hmac
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import signal
 import sys
@@ -14,27 +23,19 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import yaml
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger("exec-api")
 
-# --- Allowlist (loaded from allowlist.txt, falls back to minimal default) ---
-def _load_allowlist() -> frozenset[str]:
-    path = Path(__file__).resolve().parent / "allowlist.txt"
-    if path.exists():
-        cmds = set()
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                cmds.add(line)
-        return frozenset(cmds)
-    print("warning: allowlist.txt not found, using minimal default", file=sys.stderr)
-    return frozenset({"cat", "ls", "echo", "date"})
+
+def _fatal(msg: str) -> None:
+    print(f"FATAL: {msg}", file=sys.stderr)
+    sys.exit(1)
 
 
-ALLOWED_COMMANDS: frozenset[str] = _load_allowlist()
-
+# --- Limits ---
 COMMAND_TIMEOUT = 30  # seconds
 STDIN_MAX_BYTES = 256 * 1024  # 256 KiB
 SUPPORTED_STDIN_ENCODINGS = frozenset({"utf-8"})
@@ -45,71 +46,125 @@ FILENAME_MAX_CHARS = 128
 FILE_PLACEHOLDER_PREFIX = "@file:"
 FILESDIR_PLACEHOLDER = "@filesdir"
 
-READ_FILE_MAX_BYTES = 10 * 1024 * 1024  # 10 MiB
+WRITE_MODES = frozenset({"create", "overwrite", "append"})
+SEARCH_MAX_MATCHES = 2000
+LIST_MAX_ENTRIES = 5000
+
+# Binaries that can execute arbitrary programs or otherwise escape the allowlist.
+# These are refused at load even if listed with allowed: true. See README
+# "Allowlist hazards".
+DENIED_COMMANDS = frozenset({
+    "osascript",
+    "ssh", "sftp", "scp", "rsync",
+    "sh", "bash", "zsh", "dash", "fish", "csh", "tcsh", "ksh",
+    "python", "python2", "python3", "perl", "ruby", "node", "deno", "bun", "php", "lua",
+    "find", "fd", "xargs", "env", "nice", "nohup", "time", "timeout", "parallel",
+    "awk", "gawk", "sed", "make", "cmake", "ninja",
+    "git", "hg", "svn",
+    "vim", "vi", "nvim", "emacs", "less", "more", "man", "gdb", "lldb",
+    "tar", "zip", "unzip", "nc", "ncat", "socat", "tmux", "screen", "expect",
+})
 
 
-def _load_read_prefixes() -> tuple[Path, ...]:
-    raw = os.environ.get("EXEC_API_READ_PREFIXES", "").strip()
-    if not raw:
-        print(
-            "FATAL: EXEC_API_READ_PREFIXES not set. Set it to a colon-separated "
-            "list of absolute path prefixes that /read-file may read under.",
-            file=sys.stderr,
+# --- Configuration (config.yaml) ---
+CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
+
+
+def _load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        _fatal(
+            f"config.yaml not found at {CONFIG_PATH}. Copy config.yaml.example "
+            "to config.yaml and edit it."
         )
-        sys.exit(1)
-    candidates = [p for p in raw.split(":") if p]
+    try:
+        data = yaml.safe_load(CONFIG_PATH.read_text())
+    except yaml.YAMLError as exc:
+        _fatal(f"config.yaml is not valid YAML: {exc}")
+    if not isinstance(data, dict):
+        _fatal("config.yaml must be a mapping")
+    return data
+
+
+CONFIG: dict = _load_config()
+
+
+def _resolve_prefixes(raw_list, label: str) -> tuple[Path, ...]:
     resolved: list[Path] = []
-    for c in candidates:
+    for candidate in raw_list or []:
         try:
-            resolved.append(Path(c).expanduser().resolve(strict=True))
+            resolved.append(Path(str(candidate)).expanduser().resolve(strict=True))
         except (OSError, RuntimeError) as exc:
-            print(f"warning: read prefix '{c}' unavailable: {exc}", file=sys.stderr)
-    if not resolved:
-        print("FATAL: no usable read-file prefixes", file=sys.stderr)
-        sys.exit(1)
+            print(
+                f"warning: {label} prefix '{candidate}' unavailable: {exc}",
+                file=sys.stderr,
+            )
     return tuple(resolved)
 
 
-READ_FILE_PREFIXES: tuple[Path, ...] = _load_read_prefixes()
+_FS = CONFIG.get("filesystem") or {}
+READ_PREFIXES: tuple[Path, ...] = _resolve_prefixes(_FS.get("read_prefixes"), "read")
+WRITE_PREFIXES: tuple[Path, ...] = _resolve_prefixes(_FS.get("write_prefixes"), "write")
+MAX_READ_BYTES = int(_FS.get("max_read_bytes", 10 * 1024 * 1024))
+MAX_WRITE_BYTES = int(_FS.get("max_write_bytes", 10 * 1024 * 1024))
+ALLOW_SYMLINK_TARGET = bool(_FS.get("allow_symlink_final_target", False))
 
-def _load_command_paths() -> dict[str, str]:
-    path = Path(__file__).resolve().parent / "command-paths.json"
-    if path.exists():
-        import json as _json
-        return _json.loads(path.read_text())
-    return {}
+_OPS = CONFIG.get("operations") or {}
+OPERATION_NAMES = ("read_file", "write_file", "copy_uploaded_file", "search_files", "list_dir")
+OPERATIONS: dict[str, bool] = {name: bool(_OPS.get(name, False)) for name in OPERATION_NAMES}
+
+if any(OPERATIONS[o] for o in ("read_file", "list_dir", "search_files")) and not READ_PREFIXES:
+    _fatal("read/list/search operations are enabled but no usable read_prefixes are configured")
+if (OPERATIONS["write_file"] or OPERATIONS["copy_uploaded_file"]) and not WRITE_PREFIXES:
+    _fatal("write operations are enabled but no usable write_prefixes are configured")
 
 
-INTERNAL_COMMAND_PATHS: dict[str, str] = _load_command_paths()
+def _build_command_paths(commands) -> dict[str, str]:
+    paths: dict[str, str] = {}
+    for name, spec in (commands or {}).items():
+        spec = spec or {}
+        if not spec.get("allowed", False):
+            continue
+        if name in DENIED_COMMANDS:
+            print(
+                f"warning: command '{name}' is on the hard denylist and will not be "
+                "registered, even though config marks it allowed",
+                file=sys.stderr,
+            )
+            continue
+        exe = spec.get("executable")
+        if exe and not Path(exe).exists():
+            print(
+                f"warning: executable for '{name}' missing at {exe}, falling back to PATH",
+                file=sys.stderr,
+            )
+            exe = None
+        if exe is None:
+            exe = shutil.which(name)
+        if exe:
+            paths[name] = exe
+        else:
+            print(f"warning: '{name}' not found, will be unavailable", file=sys.stderr)
+    return paths
 
-# --- Resolve commands to absolute paths at startup ---
-COMMAND_PATHS: dict[str, str] = {}
-for cmd in ALLOWED_COMMANDS:
-    path = INTERNAL_COMMAND_PATHS.get(cmd)
-    if path and not Path(path).exists():
-        print(
-            f"warning: internal command '{cmd}' missing at {path}, falling back to PATH",
-            file=sys.stderr,
-        )
-        path = None
-    if path is None:
-        path = shutil.which(cmd)
-    if path:
-        COMMAND_PATHS[cmd] = path
-    else:
-        print(
-            f"warning: '{cmd}' not found in PATH, will be unavailable", file=sys.stderr
-        )
+
+COMMAND_PATHS: dict[str, str] = _build_command_paths(CONFIG.get("commands"))
+
+# Internal search engine (independent of the allowlist). Prefer ripgrep; fall
+# back to a pure-Python walk if rg is unavailable.
+_SEARCH_CFG = CONFIG.get("search_binary")
+SEARCH_BINARY: Optional[str] = (
+    _SEARCH_CFG if (_SEARCH_CFG and Path(_SEARCH_CFG).exists()) else shutil.which("rg")
+)
 
 # --- Auth ---
 API_TOKEN = os.environ.get("EXEC_API_TOKEN", "")
 if not API_TOKEN:
-    print("FATAL: EXEC_API_TOKEN not set", file=sys.stderr)
-    sys.exit(1)
+    _fatal("EXEC_API_TOKEN not set")
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 
+# --- Request models ---
 class InputFile(BaseModel):
     name: str = Field(min_length=1, max_length=FILENAME_MAX_CHARS)
     content_base64: str = Field(min_length=1)
@@ -129,6 +184,35 @@ class ReadFileRequest(BaseModel):
     path: str = Field(min_length=1)
 
 
+class WriteFileRequest(BaseModel):
+    path: str = Field(min_length=1)
+    content_base64: str = ""
+    mode: str = "create"
+    mkdirs: bool = False
+    expected_sha256: Optional[str] = None
+
+
+class CopyUploadedFileRequest(BaseModel):
+    file: str = Field(min_length=1)
+    dest: str = Field(min_length=1)
+    mode: str = "create"
+    mkdirs: bool = False
+    files: list[InputFile] = Field(default_factory=list, max_length=FILES_MAX_COUNT)
+
+
+class SearchFilesRequest(BaseModel):
+    root: str = Field(min_length=1)
+    query: str = Field(min_length=1)
+    glob: Optional[str] = None
+    ignore_case: bool = False
+    fixed_strings: bool = False
+    max_results: int = 1000
+
+
+class ListDirRequest(BaseModel):
+    path: str = Field(min_length=1)
+
+
 class RunRequest(BaseModel):
     command: str
     args: list[str] = []
@@ -137,6 +221,7 @@ class RunRequest(BaseModel):
     files: list[InputFile] = Field(default_factory=list, max_length=FILES_MAX_COUNT)
 
 
+# --- File upload staging ---
 def decode_input_file(upload: InputFile) -> bytes:
     try:
         content = base64.b64decode(upload.content_base64, validate=True)
@@ -240,33 +325,165 @@ def inject_file_args(
     return injected_args
 
 
+def _resolve_file_ref(ref: str, staged_paths: list[Path]) -> Path:
+    """Resolve a `@file:0` / `@file:name` / `0` / `name` reference to a staged path."""
+    key = ref.removeprefix(FILE_PLACEHOLDER_PREFIX)
+    if key.isdigit():
+        idx = int(key)
+        if 0 <= idx < len(staged_paths):
+            return staged_paths[idx]
+    for path in staged_paths:
+        if path.name == key:
+            return path
+    raise HTTPException(status_code=404, detail=f"uploaded file not found: {ref}")
+
+
+# --- Auth + policy ---
 def _check_auth(authorization: str) -> None:
     token = authorization.removeprefix("Bearer ").strip()
     if not hmac.compare_digest(token, API_TOKEN):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
-def _resolve_under_prefix(raw_path: str) -> Path:
-    try:
-        resolved = Path(raw_path).expanduser().resolve(strict=True)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="file not found")
-    except (OSError, RuntimeError) as exc:
-        raise HTTPException(status_code=400, detail=f"invalid path: {exc}") from exc
-    for prefix in READ_FILE_PREFIXES:
+def _require_operation(name: str) -> None:
+    if not OPERATIONS.get(name, False):
+        raise HTTPException(status_code=404, detail=f"operation not enabled: {name}")
+
+
+def _under_prefixes(resolved: Path, prefixes: tuple[Path, ...]) -> bool:
+    for prefix in prefixes:
         try:
             resolved.relative_to(prefix)
+            return True
         except ValueError:
             continue
-        return resolved
-    raise HTTPException(status_code=403, detail="path outside allowed prefixes")
+    return False
 
 
+def _canonical_existing(raw_path: str) -> Path:
+    try:
+        return Path(raw_path).expanduser().resolve(strict=True)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="path not found")
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid path: {exc}") from exc
+
+
+def can_read(raw_path: str) -> Path:
+    resolved = _canonical_existing(raw_path)
+    allowed = _under_prefixes(resolved, READ_PREFIXES)
+    logger.info(
+        "policy op=read original=%s resolved=%s decision=%s",
+        raw_path, resolved, "allow" if allowed else "deny",
+    )
+    if not allowed:
+        raise HTTPException(status_code=403, detail="path outside allowed read prefixes")
+    return resolved
+
+
+def can_list(raw_path: str) -> Path:
+    resolved = _canonical_existing(raw_path)
+    allowed = _under_prefixes(resolved, READ_PREFIXES)
+    logger.info(
+        "policy op=list original=%s resolved=%s decision=%s",
+        raw_path, resolved, "allow" if allowed else "deny",
+    )
+    if not allowed:
+        raise HTTPException(status_code=403, detail="path outside allowed read prefixes")
+    if not resolved.is_dir():
+        raise HTTPException(status_code=400, detail="path is not a directory")
+    return resolved
+
+
+def can_write(raw_path: str, *, mkdirs: bool) -> Path:
+    """Resolve a write destination and enforce the write policy.
+
+    Resolves the deepest existing ancestor (following symlinks) so a symlinked
+    directory cannot escape the write prefixes, then composes the destination
+    from the remaining (non-existent) path components.
+    """
+    p = Path(raw_path).expanduser()
+    if not p.is_absolute():
+        raise HTTPException(status_code=400, detail="write path must be absolute")
+
+    ancestor = p.parent
+    rel_parts = [p.name]
+    while not ancestor.exists():
+        rel_parts.append(ancestor.name)
+        if ancestor.parent == ancestor:
+            raise HTTPException(status_code=400, detail="invalid path")
+        ancestor = ancestor.parent
+
+    try:
+        real_ancestor = ancestor.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid path: {exc}") from exc
+
+    dest = real_ancestor.joinpath(*reversed(rel_parts))
+    parent_exists = dest.parent.exists()
+    if not parent_exists and not mkdirs:
+        raise HTTPException(
+            status_code=400, detail="parent directory does not exist (set mkdirs)"
+        )
+
+    allowed = _under_prefixes(dest, WRITE_PREFIXES)
+    logger.info(
+        "policy op=write original=%s resolved=%s decision=%s",
+        raw_path, dest, "allow" if allowed else "deny",
+    )
+    if not allowed:
+        raise HTTPException(status_code=403, detail="path outside allowed write prefixes")
+    if dest.is_dir():
+        raise HTTPException(status_code=400, detail="destination is a directory")
+    if dest.is_symlink() and not ALLOW_SYMLINK_TARGET:
+        raise HTTPException(status_code=403, detail="destination is a symlink")
+    return dest
+
+
+def _place_file(content: bytes, dest: Path, mode: str, mkdirs: bool) -> bool:
+    """Write content to dest atomically. Returns True if a new file was created."""
+    if mkdirs:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if mode == "append":
+        created = not dest.exists()
+        with open(dest, "ab") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return created
+
+    fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=".exec-api-tmp-")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if mode == "create":
+            try:
+                os.link(tmp, dest)
+            except FileExistsError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="destination already exists (use mode=overwrite)",
+                ) from exc
+            return True
+        existed = dest.exists()
+        os.replace(tmp, dest)
+        return not existed
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+# --- Endpoints ---
 @app.post("/read-file")
 async def read_file(req: ReadFileRequest, authorization: str = Header()):
     _check_auth(authorization)
+    _require_operation("read_file")
 
-    resolved = _resolve_under_prefix(req.path)
+    resolved = can_read(req.path)
     if not resolved.is_file():
         raise HTTPException(status_code=400, detail="path is not a regular file")
 
@@ -274,10 +491,10 @@ async def read_file(req: ReadFileRequest, authorization: str = Header()):
         size = resolved.stat().st_size
     except OSError as exc:
         raise HTTPException(status_code=400, detail=f"stat failed: {exc}") from exc
-    if size > READ_FILE_MAX_BYTES:
+    if size > MAX_READ_BYTES:
         raise HTTPException(
             status_code=413,
-            detail=f"file too large ({size} bytes, max {READ_FILE_MAX_BYTES})",
+            detail=f"file too large ({size} bytes, max {MAX_READ_BYTES})",
         )
 
     t0 = time.monotonic()
@@ -288,10 +505,7 @@ async def read_file(req: ReadFileRequest, authorization: str = Header()):
     exec_ms = round((time.monotonic() - t0) * 1000)
 
     mime, _ = mimetypes.guess_type(resolved.name)
-
-    logger.info(
-        "read_file path=%s size=%s exec_ms=%s", resolved, len(content), exec_ms
-    )
+    logger.info("read_file path=%s size=%s exec_ms=%s", resolved, len(content), exec_ms)
 
     return {
         "name": resolved.name,
@@ -299,6 +513,261 @@ async def read_file(req: ReadFileRequest, authorization: str = Header()):
         "size": len(content),
         "mime": mime,
         "content_base64": base64.b64encode(content).decode("ascii"),
+        "exec_ms": exec_ms,
+    }
+
+
+@app.post("/write-file")
+async def write_file(req: WriteFileRequest, authorization: str = Header()):
+    _check_auth(authorization)
+    _require_operation("write_file")
+
+    if req.mode not in WRITE_MODES:
+        raise HTTPException(status_code=400, detail=f"invalid mode: {req.mode}")
+
+    try:
+        content = base64.b64decode(req.content_base64, validate=True) if req.content_base64 else b""
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid base64 content") from exc
+    if len(content) > MAX_WRITE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"content too large ({len(content)} bytes, max {MAX_WRITE_BYTES})",
+        )
+
+    sha = hashlib.sha256(content).hexdigest()
+    if req.expected_sha256 and req.expected_sha256.lower() != sha:
+        raise HTTPException(status_code=400, detail="content sha256 mismatch")
+
+    dest = can_write(req.path, mkdirs=req.mkdirs)
+
+    t0 = time.monotonic()
+    try:
+        created = _place_file(content, dest, req.mode, req.mkdirs)
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"write failed: {exc}") from exc
+    exec_ms = round((time.monotonic() - t0) * 1000)
+
+    logger.info(
+        "write_file path=%s size=%s mode=%s created=%s exec_ms=%s",
+        dest, len(content), req.mode, created, exec_ms,
+    )
+    return {
+        "path": str(dest),
+        "size": len(content),
+        "sha256": sha,
+        "created": created,
+        "exec_ms": exec_ms,
+    }
+
+
+@app.post("/copy-uploaded-file")
+async def copy_uploaded_file(req: CopyUploadedFileRequest, authorization: str = Header()):
+    _check_auth(authorization)
+    _require_operation("copy_uploaded_file")
+
+    if req.mode not in WRITE_MODES:
+        raise HTTPException(status_code=400, detail=f"invalid mode: {req.mode}")
+    if not req.files:
+        raise HTTPException(status_code=400, detail="no uploaded files provided")
+
+    temp_dir, staged_paths, _ = stage_input_files(req.files)
+    t0 = time.monotonic()
+    try:
+        src = _resolve_file_ref(req.file, staged_paths)
+        content = src.read_bytes()
+        if len(content) > MAX_WRITE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"content too large ({len(content)} bytes, max {MAX_WRITE_BYTES})",
+            )
+        dest = can_write(req.dest, mkdirs=req.mkdirs)
+        created = _place_file(content, dest, req.mode, req.mkdirs)
+        sha = hashlib.sha256(content).hexdigest()
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"copy failed: {exc}") from exc
+    finally:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    exec_ms = round((time.monotonic() - t0) * 1000)
+
+    logger.info(
+        "copy_uploaded_file dest=%s size=%s mode=%s created=%s exec_ms=%s",
+        dest, len(content), req.mode, created, exec_ms,
+    )
+    return {
+        "path": str(dest),
+        "size": len(content),
+        "sha256": sha,
+        "created": created,
+        "exec_ms": exec_ms,
+    }
+
+
+async def _search_with_rg(
+    root: Path, req: SearchFilesRequest, max_results: int
+) -> tuple[list[dict], bool]:
+    args = ["--line-number", "--no-heading", "--color", "never", "--with-filename"]
+    if req.ignore_case:
+        args.append("--ignore-case")
+    if req.fixed_strings:
+        args.append("--fixed-strings")
+    if req.glob:
+        args += ["--glob", req.glob]
+    # query and root are passed positionally after `--` so they can never be
+    # interpreted as flags.
+    args += ["--", req.query, str(root)]
+
+    proc = await asyncio.create_subprocess_exec(
+        SEARCH_BINARY,
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, _stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=COMMAND_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        await proc.wait()
+        raise HTTPException(status_code=408, detail="search timed out")
+
+    matches: list[dict] = []
+    truncated = False
+    for line in stdout.decode(errors="replace").splitlines():
+        if not line:
+            continue
+        if len(matches) >= max_results:
+            truncated = True
+            break
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[1].isdigit():
+            matches.append({"path": parts[0], "line": int(parts[1]), "text": parts[2]})
+        else:
+            matches.append({"path": None, "line": None, "text": line})
+    return matches, truncated
+
+
+def _search_with_python(
+    root: Path, req: SearchFilesRequest, max_results: int
+) -> tuple[list[dict], bool]:
+    flags = re.IGNORECASE if req.ignore_case else 0
+    if req.fixed_strings:
+        pattern = re.compile(re.escape(req.query), flags)
+    else:
+        try:
+            pattern = re.compile(req.query, flags)
+        except re.error as exc:
+            raise HTTPException(status_code=400, detail=f"invalid query regex: {exc}") from exc
+
+    matches: list[dict] = []
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in files:
+            if req.glob and not fnmatch.fnmatch(fn, req.glob):
+                continue
+            fpath = Path(dirpath) / fn
+            try:
+                with open(fpath, "r", errors="ignore") as fh:
+                    for lineno, line in enumerate(fh, 1):
+                        if pattern.search(line):
+                            if len(matches) >= max_results:
+                                return matches, True
+                            matches.append(
+                                {"path": str(fpath), "line": lineno, "text": line.rstrip("\n")}
+                            )
+            except OSError:
+                continue
+    return matches, False
+
+
+@app.post("/search-files")
+async def search_files(req: SearchFilesRequest, authorization: str = Header()):
+    _check_auth(authorization)
+    _require_operation("search_files")
+
+    root = can_list(req.root)
+    max_results = max(1, min(req.max_results, SEARCH_MAX_MATCHES))
+
+    t0 = time.monotonic()
+    if SEARCH_BINARY:
+        matches, truncated = await _search_with_rg(root, req, max_results)
+        engine = "rg"
+    else:
+        matches, truncated = _search_with_python(root, req, max_results)
+        engine = "python"
+    exec_ms = round((time.monotonic() - t0) * 1000)
+
+    logger.info(
+        "search_files root=%s engine=%s matches=%s truncated=%s exec_ms=%s",
+        root, engine, len(matches), truncated, exec_ms,
+    )
+    return {
+        "root": str(root),
+        "matches": matches,
+        "truncated": truncated,
+        "engine": engine,
+        "exec_ms": exec_ms,
+    }
+
+
+@app.post("/list-dir")
+async def list_dir(req: ListDirRequest, authorization: str = Header()):
+    _check_auth(authorization)
+    _require_operation("list_dir")
+
+    target = can_list(req.path)
+
+    t0 = time.monotonic()
+    entries: list[dict] = []
+    truncated = False
+    try:
+        with os.scandir(target) as it:
+            for entry in it:
+                if len(entries) >= LIST_MAX_ENTRIES:
+                    truncated = True
+                    break
+                try:
+                    if entry.is_symlink():
+                        etype = "symlink"
+                    elif entry.is_dir():
+                        etype = "dir"
+                    elif entry.is_file():
+                        etype = "file"
+                    else:
+                        etype = "other"
+                    st = entry.stat(follow_symlinks=False)
+                    entries.append(
+                        {
+                            "name": entry.name,
+                            "type": etype,
+                            "size": st.st_size,
+                            "mtime": round(st.st_mtime),
+                        }
+                    )
+                except OSError:
+                    continue
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"list failed: {exc}") from exc
+    exec_ms = round((time.monotonic() - t0) * 1000)
+
+    entries.sort(key=lambda e: e["name"])
+    logger.info(
+        "list_dir path=%s entries=%s truncated=%s exec_ms=%s",
+        target, len(entries), truncated, exec_ms,
+    )
+    return {
+        "path": str(target),
+        "entries": entries,
+        "truncated": truncated,
         "exec_ms": exec_ms,
     }
 

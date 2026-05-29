@@ -4,5 +4,5 @@ venv/
 bin/
 logs/
 .env
-allowlist.txt
-command-paths.json
+config.yaml
+.mcp.json
