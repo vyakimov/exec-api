@@ -96,16 +96,17 @@ PLIST_PATH="$HOME/Library/LaunchAgents/${LABEL}.plist"
 UVICORN="$REPO_DIR/venv/bin/uvicorn"
 LOG_DIR="$REPO_DIR/logs"
 
-# Create venv if needed
-if [ ! -x "$UVICORN" ]; then
-    echo "Creating venv and installing dependencies..."
-    if command -v uv >/dev/null 2>&1; then
-        uv venv "$REPO_DIR/venv"
-        uv pip install fastapi uvicorn --python "$REPO_DIR/venv/bin/python"
-    else
-        python3 -m venv "$REPO_DIR/venv"
-        "$REPO_DIR/venv/bin/pip" install -q fastapi uvicorn
-    fi
+# Create venv if needed, then sync dependencies from requirements.txt. The
+# requirements sync runs even when the venv already exists so a venv predating
+# a new dependency (e.g. pyyaml) is brought up to date rather than crash-looping
+# on a missing import at startup.
+REQUIREMENTS="$REPO_DIR/requirements.txt"
+if command -v uv >/dev/null 2>&1; then
+    [ -x "$UVICORN" ] || uv venv "$REPO_DIR/venv"
+    uv pip install -r "$REQUIREMENTS" --python "$REPO_DIR/venv/bin/python"
+else
+    [ -x "$REPO_DIR/venv/bin/pip" ] || python3 -m venv "$REPO_DIR/venv"
+    "$REPO_DIR/venv/bin/pip" install -q -r "$REQUIREMENTS"
 fi
 
 # Create log directory
