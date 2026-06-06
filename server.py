@@ -841,6 +841,24 @@ async def run_command(req: RunRequest, authorization: str = Header()):
             proc.kill()
         await proc.wait()
         raise HTTPException(status_code=408, detail="command timed out")
+    except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
+        # The command is allow-listed but its executable is missing or not
+        # runnable at the configured path. Surface an actionable error instead
+        # of an opaque 500.
+        logger.error(
+            "command=%s executable_unrunnable path=%s error=%s",
+            req.command,
+            abs_path,
+            exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"command '{req.command}' is allow-listed but its executable "
+                f"could not be run at '{abs_path}': {exc.strerror or exc}. "
+                "Check the 'executable' path in exec-api config.yaml."
+            ),
+        ) from exc
     finally:
         if temp_dir is not None:
             shutil.rmtree(temp_dir, ignore_errors=True)
