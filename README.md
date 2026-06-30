@@ -33,6 +33,8 @@ allowlist (`/run`) is only a last line of defense.
   interpolation, no injection surface. `search-files` passes the query positionally
   after `--`.
 - **Bearer-token auth** — every request requires a token (constant-time comparison).
+  Multiple tokens can map to different **principals**, each with its own policy
+  (filesystem prefixes, operation toggles, command set) — see [Per-user policies](#per-user-policies).
 - **Timeouts** — 30 seconds per command/search.
 - **File uploads** — basename-only validation, 5 MiB per file, 10 MiB total,
   per-request temp dir with guaranteed cleanup.
@@ -58,6 +60,8 @@ being exhaustive:
 If you need one of these, run exec-api in a dedicated sandbox VM where breaking out of the allowlist has no consequences — the allowlist alone will not contain it.
 
 The filesystem prefixes deserve the same scrutiny: anything under `read_prefixes` is readable, and anything under `write_prefixes` is writable, by anyone with the token. Keep them narrow; avoid broad ones like `$HOME`, which expose `~/.ssh`, `~/.aws`, browser profiles, and keychains.
+
+The same "args are unfiltered" rule limits what per-command **env injection** can enforce. A policy can inject env into a command's process (e.g. `YNAB_PROFILE=emma`) to scope *who* is calling, but it cannot stop the caller from passing an overriding flag (`--profile victor`, `--profile=victor`, `-p victor`, …). exec-api owns *who is calling and what env they get*; the **CLI must own its own identity** — prefer/lock to the injected env var, refuse or restrict overriding flags, and echo the effective identity in its output. Do not rely on exec-api to police identity by inspecting argv.
 
 ## Quick Start
 
@@ -134,6 +138,58 @@ commands:                              # /run allowlist (last line of defense)
   ping:    { allowed: true }
   osascript: { allowed: false }        # also blocked by the hard denylist
 ```
+
+### Per-user policies
+
+By default exec-api runs in **single-token mode**: the one token in `EXEC_API_TOKEN`
+gets the policy defined by the top-level `filesystem` / `operations` / `commands`
+blocks above. Anyone with that token has full access.
+
+Add an optional `auth` / `policies` section to map **different tokens to different
+policies** — e.g. a partner's agent on another host that can run a couple of CLIs
+but touch no files. It is fully backward-compatible: **if `auth:` is absent, nothing
+changes.**
+
+```yaml
+auth:
+  tokens:
+    victor: { env: EXEC_API_TOKEN,      policy: owner }    # each token from its own env var
+    emma:   { env: EXEC_API_TOKEN_EMMA, policy: partner }
+
+policies:
+  owner:
+    filesystem: inherit_default        # reuse the top-level blocks
+    operations: inherit_default
+    commands: inherit_default
+  partner:
+    filesystem:                        # no shared paths -> no filesystem access
+      read_prefixes: []
+      write_prefixes: []
+    operations: {}                     # every read/write/list/search op -> 404
+    commands:                          # command surfaces only, by name
+      inventory: {}
+      huckctl: {}
+      ynab: { env: { YNAB_PROFILE: emma } }   # per-command env injection
+```
+
+- **`tokens`** — each entry names a principal and points at the env var holding its
+  bearer token (kept out of `config.yaml`, same as `EXEC_API_TOKEN`). A
+  configured-but-empty token, or two principals sharing a token value, is fatal at
+  startup.
+- **`policies`** — each field is either `inherit_default` (reuse the top-level block)
+  or an explicit narrower value. `commands` references **names from the top-level
+  `commands` registry** (executables and the hard denylist are still resolved there,
+  once); a policy referencing an unknown or unresolved command is fatal at startup.
+- **Per-command `env`** is merged over the server environment for that command only.
+  See the [identity caveat](#allowlist-hazards): this scopes *who is calling*, but the
+  CLI must enforce its own identity — args are not filtered.
+- **Fail-closed.** Giving a principal all operations off makes every filesystem
+  endpoint 404. And a policy that enables an operation while leaving the matching
+  prefixes empty is rejected at **startup** (the server refuses to run), so there is
+  no way to end up with an enabled-but-unbounded operation.
+
+Every policy decision and `/run` invocation is logged with the principal name for an
+audit trail.
 
 ## Client
 
