@@ -7,6 +7,42 @@
 # Copy to config.yaml (gitignored) and edit. EXEC_API_TOKEN stays in the
 # environment / .env — secrets do not belong in this file.
 
+# --- Multi-user auth (optional) ---
+#
+# By default there is no `auth:` section: the single token in EXEC_API_TOKEN gets
+# the policy defined by the top-level filesystem/operations/commands blocks below.
+# This is the legacy "one token = full access" mode and needs no changes.
+#
+# To give different tokens different policies (e.g. a partner's agent that can run
+# a few CLIs but touch no files), uncomment `auth:` and `policies:`. Each token is
+# resolved from its own env var; a policy may `inherit_default` (reuse the
+# top-level blocks) or define its own narrower filesystem/operations/commands.
+# A policy's `commands:` references names from the top-level `commands:` registry
+# below and may add per-command `env:` overrides (injected into that command's
+# process — see the YNAB example).
+#
+# auth:
+#   tokens:
+#     victor: { env: EXEC_API_TOKEN,      policy: owner }
+#     emma:   { env: EXEC_API_TOKEN_EMMA, policy: partner }
+#
+# policies:
+#   owner:
+#     filesystem: inherit_default
+#     operations: inherit_default
+#     commands: inherit_default
+#   partner:
+#     filesystem:                 # no shared paths -> no filesystem access
+#       read_prefixes: []
+#       write_prefixes: []
+#     operations: {}              # every read/write/list/search op 404s
+#     commands:                   # command surfaces only
+#       inventory: {}
+#       huckctl: {}
+#       ynab: { env: { YNAB_PROFILE: emma } }   # exec-api scopes WHO is calling;
+#                                               # the ynab CLI must enforce the
+#                                               # profile and ignore --profile.
+
 filesystem:
   # Absolute path prefixes that read_file / list_dir / search_files may touch.
   # Resolved at startup with symlinks followed. Keep narrow — anything under a
@@ -52,6 +88,8 @@ commands:
   goplaces: { allowed: true }
   accli: { allowed: true }
   ping: { allowed: true }
+  inventory: { allowed: true }   # referenced by the `partner` policy example above
+  ynab: { allowed: true }        # referenced by the `partner` policy example above
 
   # Superseded by policy-aware operations. Listed here for documentation; the
   # `replacement` field is informational only.

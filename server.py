@@ -20,6 +20,7 @@ import signal
 import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -67,7 +68,11 @@ DENIED_COMMANDS = frozenset({
 
 
 # --- Configuration (config.yaml) ---
-CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
+# EXEC_API_CONFIG overrides the config path (used by the test suite); defaults to
+# config.yaml next to this file.
+CONFIG_PATH = Path(
+    os.environ.get("EXEC_API_CONFIG") or Path(__file__).resolve().parent / "config.yaml"
+)
 
 
 def _load_config() -> dict:
@@ -156,10 +161,150 @@ SEARCH_BINARY: Optional[str] = (
     _SEARCH_CFG if (_SEARCH_CFG and Path(_SEARCH_CFG).exists()) else shutil.which("rg")
 )
 
-# --- Auth ---
-API_TOKEN = os.environ.get("EXEC_API_TOKEN", "")
-if not API_TOKEN:
-    _fatal("EXEC_API_TOKEN not set")
+# --- Principals (token -> identity -> policy) ---
+#
+# Each bearer token maps to a named principal carrying its own policy: filesystem
+# prefixes, operation toggles, and the subset of the command registry it may run
+# (with optional per-command environment overrides). The top-level
+# filesystem/operations/commands blocks above are the "default" policy that
+# `inherit_default` reuses and that legacy (no `auth:` section) mode applies to a
+# single implicit owner.
+INHERIT = "inherit_default"
+
+
+@dataclass(frozen=True)
+class Principal:
+    name: str
+    read_prefixes: tuple[Path, ...]
+    write_prefixes: tuple[Path, ...]
+    operations: dict[str, bool]
+    commands: dict[str, str]  # command name -> resolved executable path
+    command_env: dict[str, dict[str, str]] = field(default_factory=dict)
+
+
+def _policy_filesystem(name: str, spec) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    if spec is None or spec == INHERIT:
+        return READ_PREFIXES, WRITE_PREFIXES
+    if not isinstance(spec, dict):
+        _fatal(f"policy '{name}': filesystem must be a mapping or '{INHERIT}'")
+    reads = _resolve_prefixes(spec.get("read_prefixes"), f"{name} read")
+    writes = _resolve_prefixes(spec.get("write_prefixes"), f"{name} write")
+    return reads, writes
+
+
+def _policy_operations(name: str, spec) -> dict[str, bool]:
+    if spec is None or spec == INHERIT:
+        return dict(OPERATIONS)
+    if not isinstance(spec, dict):
+        _fatal(f"policy '{name}': operations must be a mapping or '{INHERIT}'")
+    return {op: bool(spec.get(op, False)) for op in OPERATION_NAMES}
+
+
+def _policy_commands(name: str, spec) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+    if spec is None or spec == INHERIT:
+        return dict(COMMAND_PATHS), {}
+    if not isinstance(spec, dict):
+        _fatal(f"policy '{name}': commands must be a mapping or '{INHERIT}'")
+    commands: dict[str, str] = {}
+    command_env: dict[str, dict[str, str]] = {}
+    for cmd, cmd_spec in spec.items():
+        if cmd not in COMMAND_PATHS:
+            _fatal(
+                f"policy '{name}': command '{cmd}' is not an allowed, resolvable entry "
+                "in the top-level `commands` registry"
+            )
+        commands[cmd] = COMMAND_PATHS[cmd]
+        cmd_spec = cmd_spec or {}
+        env = cmd_spec.get("env") or {}
+        if env:
+            if not isinstance(env, dict):
+                _fatal(f"policy '{name}': env for command '{cmd}' must be a mapping")
+            command_env[cmd] = {str(k): str(v) for k, v in env.items()}
+    return commands, command_env
+
+
+def _validate_principal_policy(p: Principal) -> None:
+    if any(p.operations[o] for o in ("read_file", "list_dir", "search_files")) and not p.read_prefixes:
+        _fatal(
+            f"policy for principal '{p.name}' enables read/list/search but has no usable "
+            "read_prefixes"
+        )
+    if (p.operations["write_file"] or p.operations["copy_uploaded_file"]) and not p.write_prefixes:
+        _fatal(
+            f"policy for principal '{p.name}' enables write/copy but has no usable "
+            "write_prefixes"
+        )
+
+
+def _build_principals() -> dict[str, Principal]:
+    auth = CONFIG.get("auth")
+
+    # Legacy mode: no `auth:` section -> single implicit owner from EXEC_API_TOKEN
+    # with the top-level (default) policy. Behaviour is identical to before.
+    if not auth:
+        token = os.environ.get("EXEC_API_TOKEN", "")
+        if not token:
+            _fatal("EXEC_API_TOKEN not set")
+        owner = Principal(
+            name="owner",
+            read_prefixes=READ_PREFIXES,
+            write_prefixes=WRITE_PREFIXES,
+            operations=dict(OPERATIONS),
+            commands=dict(COMMAND_PATHS),
+        )
+        return {token: owner}
+
+    if not isinstance(auth, dict):
+        _fatal("config.yaml: `auth` must be a mapping")
+    tokens_cfg = auth.get("tokens")
+    if not isinstance(tokens_cfg, dict) or not tokens_cfg:
+        _fatal("config.yaml: `auth.tokens` must be a non-empty mapping")
+    policies_cfg = CONFIG.get("policies") or {}
+    if not isinstance(policies_cfg, dict):
+        _fatal("config.yaml: `policies` must be a mapping")
+
+    principals: dict[str, Principal] = {}
+    for name, tok_spec in tokens_cfg.items():
+        tok_spec = tok_spec or {}
+        env_name = tok_spec.get("env")
+        if not env_name:
+            _fatal(f"auth.tokens.{name}: missing `env` (the env var holding the token)")
+        token = os.environ.get(env_name, "")
+        if not token:
+            _fatal(f"auth.tokens.{name}: env var {env_name} is not set or empty")
+        if token in principals:
+            _fatal(
+                f"auth.tokens.{name}: token value collides with another principal "
+                "(two principals share the same token)"
+            )
+
+        policy_name = tok_spec.get("policy")
+        if not policy_name:
+            _fatal(f"auth.tokens.{name}: missing `policy`")
+        if policy_name not in policies_cfg:
+            _fatal(f"auth.tokens.{name}: policy '{policy_name}' not found under `policies`")
+        policy = policies_cfg[policy_name] or {}
+        if not isinstance(policy, dict):
+            _fatal(f"policies.{policy_name}: must be a mapping")
+
+        reads, writes = _policy_filesystem(name, policy.get("filesystem"))
+        operations = _policy_operations(name, policy.get("operations"))
+        commands, command_env = _policy_commands(name, policy.get("commands"))
+        principal = Principal(
+            name=name,
+            read_prefixes=reads,
+            write_prefixes=writes,
+            operations=operations,
+            commands=commands,
+            command_env=command_env,
+        )
+        _validate_principal_policy(principal)
+        principals[token] = principal
+
+    return principals
+
+
+PRINCIPALS: dict[str, Principal] = _build_principals()
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -339,14 +484,21 @@ def _resolve_file_ref(ref: str, staged_paths: list[Path]) -> Path:
 
 
 # --- Auth + policy ---
-def _check_auth(authorization: str) -> None:
+def _check_auth(authorization: str) -> Principal:
     token = authorization.removeprefix("Bearer ").strip()
-    if not hmac.compare_digest(token, API_TOKEN):
+    # Compare against every principal's token without early-exit so the match is
+    # constant-time with respect to which (or whether a) principal matched.
+    matched: Optional[Principal] = None
+    for tok, principal in PRINCIPALS.items():
+        if hmac.compare_digest(token, tok):
+            matched = principal
+    if matched is None:
         raise HTTPException(status_code=401, detail="unauthorized")
+    return matched
 
 
-def _require_operation(name: str) -> None:
-    if not OPERATIONS.get(name, False):
+def _require_operation(principal: Principal, name: str) -> None:
+    if not principal.operations.get(name, False):
         raise HTTPException(status_code=404, detail=f"operation not enabled: {name}")
 
 
@@ -369,24 +521,24 @@ def _canonical_existing(raw_path: str) -> Path:
         raise HTTPException(status_code=400, detail=f"invalid path: {exc}") from exc
 
 
-def can_read(raw_path: str) -> Path:
+def can_read(principal: Principal, raw_path: str) -> Path:
     resolved = _canonical_existing(raw_path)
-    allowed = _under_prefixes(resolved, READ_PREFIXES)
+    allowed = _under_prefixes(resolved, principal.read_prefixes)
     logger.info(
-        "policy op=read original=%s resolved=%s decision=%s",
-        raw_path, resolved, "allow" if allowed else "deny",
+        "policy principal=%s op=read original=%s resolved=%s decision=%s",
+        principal.name, raw_path, resolved, "allow" if allowed else "deny",
     )
     if not allowed:
         raise HTTPException(status_code=403, detail="path outside allowed read prefixes")
     return resolved
 
 
-def can_list(raw_path: str) -> Path:
+def can_list(principal: Principal, raw_path: str) -> Path:
     resolved = _canonical_existing(raw_path)
-    allowed = _under_prefixes(resolved, READ_PREFIXES)
+    allowed = _under_prefixes(resolved, principal.read_prefixes)
     logger.info(
-        "policy op=list original=%s resolved=%s decision=%s",
-        raw_path, resolved, "allow" if allowed else "deny",
+        "policy principal=%s op=list original=%s resolved=%s decision=%s",
+        principal.name, raw_path, resolved, "allow" if allowed else "deny",
     )
     if not allowed:
         raise HTTPException(status_code=403, detail="path outside allowed read prefixes")
@@ -395,7 +547,7 @@ def can_list(raw_path: str) -> Path:
     return resolved
 
 
-def can_write(raw_path: str, *, mkdirs: bool) -> Path:
+def can_write(principal: Principal, raw_path: str, *, mkdirs: bool) -> Path:
     """Resolve a write destination and enforce the write policy.
 
     Resolves the deepest existing ancestor (following symlinks) so a symlinked
@@ -426,10 +578,10 @@ def can_write(raw_path: str, *, mkdirs: bool) -> Path:
             status_code=400, detail="parent directory does not exist (set mkdirs)"
         )
 
-    allowed = _under_prefixes(dest, WRITE_PREFIXES)
+    allowed = _under_prefixes(dest, principal.write_prefixes)
     logger.info(
-        "policy op=write original=%s resolved=%s decision=%s",
-        raw_path, dest, "allow" if allowed else "deny",
+        "policy principal=%s op=write original=%s resolved=%s decision=%s",
+        principal.name, raw_path, dest, "allow" if allowed else "deny",
     )
     if not allowed:
         raise HTTPException(status_code=403, detail="path outside allowed write prefixes")
@@ -480,10 +632,10 @@ def _place_file(content: bytes, dest: Path, mode: str, mkdirs: bool) -> bool:
 # --- Endpoints ---
 @app.post("/read-file")
 async def read_file(req: ReadFileRequest, authorization: str = Header()):
-    _check_auth(authorization)
-    _require_operation("read_file")
+    principal = _check_auth(authorization)
+    _require_operation(principal, "read_file")
 
-    resolved = can_read(req.path)
+    resolved = can_read(principal, req.path)
     if not resolved.is_file():
         raise HTTPException(status_code=400, detail="path is not a regular file")
 
@@ -519,8 +671,8 @@ async def read_file(req: ReadFileRequest, authorization: str = Header()):
 
 @app.post("/write-file")
 async def write_file(req: WriteFileRequest, authorization: str = Header()):
-    _check_auth(authorization)
-    _require_operation("write_file")
+    principal = _check_auth(authorization)
+    _require_operation(principal, "write_file")
 
     if req.mode not in WRITE_MODES:
         raise HTTPException(status_code=400, detail=f"invalid mode: {req.mode}")
@@ -539,7 +691,7 @@ async def write_file(req: WriteFileRequest, authorization: str = Header()):
     if req.expected_sha256 and req.expected_sha256.lower() != sha:
         raise HTTPException(status_code=400, detail="content sha256 mismatch")
 
-    dest = can_write(req.path, mkdirs=req.mkdirs)
+    dest = can_write(principal, req.path, mkdirs=req.mkdirs)
 
     t0 = time.monotonic()
     try:
@@ -565,8 +717,8 @@ async def write_file(req: WriteFileRequest, authorization: str = Header()):
 
 @app.post("/copy-uploaded-file")
 async def copy_uploaded_file(req: CopyUploadedFileRequest, authorization: str = Header()):
-    _check_auth(authorization)
-    _require_operation("copy_uploaded_file")
+    principal = _check_auth(authorization)
+    _require_operation(principal, "copy_uploaded_file")
 
     if req.mode not in WRITE_MODES:
         raise HTTPException(status_code=400, detail=f"invalid mode: {req.mode}")
@@ -583,7 +735,7 @@ async def copy_uploaded_file(req: CopyUploadedFileRequest, authorization: str = 
                 status_code=413,
                 detail=f"content too large ({len(content)} bytes, max {MAX_WRITE_BYTES})",
             )
-        dest = can_write(req.dest, mkdirs=req.mkdirs)
+        dest = can_write(principal, req.dest, mkdirs=req.mkdirs)
         created = _place_file(content, dest, req.mode, req.mkdirs)
         sha = hashlib.sha256(content).hexdigest()
     except HTTPException:
@@ -691,10 +843,10 @@ def _search_with_python(
 
 @app.post("/search-files")
 async def search_files(req: SearchFilesRequest, authorization: str = Header()):
-    _check_auth(authorization)
-    _require_operation("search_files")
+    principal = _check_auth(authorization)
+    _require_operation(principal, "search_files")
 
-    root = can_list(req.root)
+    root = can_list(principal, req.root)
     max_results = max(1, min(req.max_results, SEARCH_MAX_MATCHES))
 
     t0 = time.monotonic()
@@ -721,10 +873,10 @@ async def search_files(req: SearchFilesRequest, authorization: str = Header()):
 
 @app.post("/list-dir")
 async def list_dir(req: ListDirRequest, authorization: str = Header()):
-    _check_auth(authorization)
-    _require_operation("list_dir")
+    principal = _check_auth(authorization)
+    _require_operation(principal, "list_dir")
 
-    target = can_list(req.path)
+    target = can_list(principal, req.path)
 
     t0 = time.monotonic()
     entries: list[dict] = []
@@ -774,10 +926,10 @@ async def list_dir(req: ListDirRequest, authorization: str = Header()):
 
 @app.post("/run")
 async def run_command(req: RunRequest, authorization: str = Header()):
-    _check_auth(authorization)
+    principal = _check_auth(authorization)
 
-    # Allowlist check
-    if req.command not in COMMAND_PATHS:
+    # Allowlist check (scoped to this principal's policy)
+    if req.command not in principal.commands:
         raise HTTPException(
             status_code=403, detail=f"command not allowed: {req.command}"
         )
@@ -817,8 +969,12 @@ async def run_command(req: RunRequest, authorization: str = Header()):
 
     injected_args = inject_file_args(req.args, staged_paths, temp_dir)
 
-    # Run the command
-    abs_path = COMMAND_PATHS[req.command]
+    # Run the command. The child inherits the server environment with the
+    # principal's per-command overrides layered on top (e.g. YNAB_PROFILE=emma).
+    # Note: env= replaces the environment wholesale, so we must merge rather than
+    # pass overrides alone, or PATH/HOME and friends would be lost.
+    abs_path = principal.commands[req.command]
+    child_env = {**os.environ, **principal.command_env.get(req.command, {})}
     t0 = time.monotonic()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -828,6 +984,7 @@ async def run_command(req: RunRequest, authorization: str = Header()):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            env=child_env,
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(input=stdin_bytes), timeout=COMMAND_TIMEOUT
@@ -871,8 +1028,9 @@ async def run_command(req: RunRequest, authorization: str = Header()):
     exec_ms = round((time.monotonic() - t0) * 1000)
 
     logger.info(
-        "command=%s exit_code=%s stdin_bytes=%s file_count=%s file_bytes=%s exec_ms=%s",
+        "command=%s principal=%s exit_code=%s stdin_bytes=%s file_count=%s file_bytes=%s exec_ms=%s",
         req.command,
+        principal.name,
         proc.returncode,
         len(stdin_bytes) if stdin_bytes is not None else 0,
         len(staged_paths),
