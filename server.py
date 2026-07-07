@@ -22,7 +22,6 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import yaml
 from fastapi import FastAPI, Header, HTTPException
@@ -157,7 +156,7 @@ COMMAND_PATHS: dict[str, str] = _build_command_paths(CONFIG.get("commands"))
 # Internal search engine (independent of the allowlist). Prefer ripgrep; fall
 # back to a pure-Python walk if rg is unavailable.
 _SEARCH_CFG = CONFIG.get("search_binary")
-SEARCH_BINARY: Optional[str] = (
+SEARCH_BINARY: str | None = (
     _SEARCH_CFG if (_SEARCH_CFG and Path(_SEARCH_CFG).exists()) else shutil.which("rg")
 )
 
@@ -224,7 +223,8 @@ def _policy_commands(name: str, spec) -> tuple[dict[str, str], dict[str, dict[st
 
 
 def _validate_principal_policy(p: Principal) -> None:
-    if any(p.operations[o] for o in ("read_file", "list_dir", "search_files")) and not p.read_prefixes:
+    reads_enabled = any(p.operations[o] for o in ("read_file", "list_dir", "search_files"))
+    if reads_enabled and not p.read_prefixes:
         _fatal(
             f"policy for principal '{p.name}' enables read/list/search but has no usable "
             "read_prefixes"
@@ -334,7 +334,7 @@ class WriteFileRequest(BaseModel):
     content_base64: str = ""
     mode: str = "create"
     mkdirs: bool = False
-    expected_sha256: Optional[str] = None
+    expected_sha256: str | None = None
 
 
 class CopyUploadedFileRequest(BaseModel):
@@ -348,7 +348,7 @@ class CopyUploadedFileRequest(BaseModel):
 class SearchFilesRequest(BaseModel):
     root: str = Field(min_length=1)
     query: str = Field(min_length=1)
-    glob: Optional[str] = None
+    glob: str | None = None
     ignore_case: bool = False
     fixed_strings: bool = False
     max_results: int = 1000
@@ -361,7 +361,7 @@ class ListDirRequest(BaseModel):
 class RunRequest(BaseModel):
     command: str
     args: list[str] = []
-    stdin_text: Optional[str] = None
+    stdin_text: str | None = None
     stdin_encoding: str = "utf-8"
     files: list[InputFile] = Field(default_factory=list, max_length=FILES_MAX_COUNT)
 
@@ -386,7 +386,7 @@ def decode_input_file(upload: InputFile) -> bytes:
     return content
 
 
-def stage_input_files(files: list[InputFile]) -> tuple[Optional[Path], list[Path], int]:
+def stage_input_files(files: list[InputFile]) -> tuple[Path | None, list[Path], int]:
     if not files:
         return None, [], 0
 
@@ -431,7 +431,7 @@ def stage_input_files(files: list[InputFile]) -> tuple[Optional[Path], list[Path
 
 
 def inject_file_args(
-    args: list[str], staged_paths: list[Path], temp_dir: Optional[Path]
+    args: list[str], staged_paths: list[Path], temp_dir: Path | None
 ) -> list[str]:
     if not staged_paths:
         return args
@@ -488,7 +488,7 @@ def _check_auth(authorization: str) -> Principal:
     token = authorization.removeprefix("Bearer ").strip()
     # Compare against every principal's token without early-exit so the match is
     # constant-time with respect to which (or whether a) principal matched.
-    matched: Optional[Principal] = None
+    matched: Principal | None = None
     for tok, principal in PRINCIPALS.items():
         if hmac.compare_digest(token, tok):
             matched = principal
@@ -516,7 +516,7 @@ def _canonical_existing(raw_path: str) -> Path:
     try:
         return Path(raw_path).expanduser().resolve(strict=True)
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="path not found")
+        raise HTTPException(status_code=404, detail="path not found") from None
     except (OSError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=f"invalid path: {exc}") from exc
 
@@ -785,13 +785,13 @@ async def _search_with_rg(
         stdout, _stderr = await asyncio.wait_for(
             proc.communicate(), timeout=COMMAND_TIMEOUT
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             proc.kill()
         await proc.wait()
-        raise HTTPException(status_code=408, detail="search timed out")
+        raise HTTPException(status_code=408, detail="search timed out") from None
 
     matches: list[dict] = []
     truncated = False
@@ -828,7 +828,7 @@ def _search_with_python(
                 continue
             fpath = Path(dirpath) / fn
             try:
-                with open(fpath, "r", errors="ignore") as fh:
+                with open(fpath, errors="ignore") as fh:
                     for lineno, line in enumerate(fh, 1):
                         if pattern.search(line):
                             if len(matches) >= max_results:
@@ -935,7 +935,7 @@ async def run_command(req: RunRequest, authorization: str = Header()):
         )
 
     # Validate stdin fields
-    stdin_bytes: Optional[bytes] = None
+    stdin_bytes: bytes | None = None
     if req.stdin_text is not None:
         if req.stdin_encoding not in SUPPORTED_STDIN_ENCODINGS:
             raise HTTPException(
@@ -949,7 +949,7 @@ async def run_command(req: RunRequest, authorization: str = Header()):
                 detail=f"stdin_text too large ({len(stdin_bytes)} bytes, max {STDIN_MAX_BYTES})",
             )
 
-    temp_dir: Optional[Path] = None
+    temp_dir: Path | None = None
     staged_paths: list[Path] = []
     staged_file_bytes = 0
     if req.files:
@@ -989,7 +989,7 @@ async def run_command(req: RunRequest, authorization: str = Header()):
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(input=stdin_bytes), timeout=COMMAND_TIMEOUT
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         # Kill the whole process group so children spawned by the command
         # (e.g. via xargs/make) don't outlive the request.
         try:
@@ -997,7 +997,7 @@ async def run_command(req: RunRequest, authorization: str = Header()):
         except (ProcessLookupError, PermissionError):
             proc.kill()
         await proc.wait()
-        raise HTTPException(status_code=408, detail="command timed out")
+        raise HTTPException(status_code=408, detail="command timed out") from None
     except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:
         # The command is allow-listed but its executable is missing or not
         # runnable at the configured path. Surface an actionable error instead
@@ -1028,7 +1028,8 @@ async def run_command(req: RunRequest, authorization: str = Header()):
     exec_ms = round((time.monotonic() - t0) * 1000)
 
     logger.info(
-        "command=%s principal=%s exit_code=%s stdin_bytes=%s file_count=%s file_bytes=%s exec_ms=%s",
+        "command=%s principal=%s exit_code=%s stdin_bytes=%s file_count=%s "
+        "file_bytes=%s exec_ms=%s",
         req.command,
         principal.name,
         proc.returncode,

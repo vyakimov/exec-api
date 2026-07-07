@@ -214,7 +214,10 @@ client/exec-api --json ls -la
 # Retry on transport errors
 client/exec-api --json --retry 3 echo hello
 
-# Retry on any error (transport + nonzero exit)
+# Retry on any error (transport + nonzero exit).
+# CAUTION: /run is not idempotent — a command that timed out or failed midway may
+# have had side effects, and --retry-on any will run it again. Use only for
+# commands that are safe to repeat.
 client/exec-api --json --retry 3 --retry-on any mycommand
 
 # Pipe stdin

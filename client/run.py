@@ -7,8 +7,8 @@ import os
 import random
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 HOST = os.environ.get("EXEC_API_HOST", "127.0.0.1:8019")
 TOKEN = os.environ.get("EXEC_API_TOKEN", "")
@@ -204,9 +204,7 @@ def should_retry(envelope, retry_on):
     et = envelope.get("error_type")
     if et == "transport":
         return True
-    if retry_on == "any" and et == "command":
-        return True
-    return False
+    return retry_on == "any" and et == "command"
 
 
 def backoff_sleep(attempt):
@@ -285,7 +283,10 @@ def parse_json_request(json_mode, raw=None):
             if not isinstance(f, dict):
                 emit_error(json_mode, f"--json-request: files[{i}] must be an object")
             if "name" not in f or "content_base64" not in f:
-                emit_error(json_mode, f"--json-request: files[{i}] requires 'name' and 'content_base64'")
+                emit_error(
+                    json_mode,
+                    f"--json-request: files[{i}] requires 'name' and 'content_base64'",
+                )
         body["files"] = files
 
     return command, argv_field, body
