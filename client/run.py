@@ -11,6 +11,9 @@ import urllib.error
 import urllib.request
 
 HOST = os.environ.get("EXEC_API_HOST", "127.0.0.1:8019")
+# EXEC_API_HOST may carry a scheme (e.g. https://exec.example.com behind a
+# TLS-terminating proxy); bare host:port keeps the historical http:// default.
+BASE_URL = HOST.rstrip("/") if "://" in HOST else f"http://{HOST}"
 TOKEN = os.environ.get("EXEC_API_TOKEN", "")
 
 TRANSPORT = "exec-api"
@@ -447,7 +450,7 @@ def main():
         if mode_name == "--read-file":
             payload = json.dumps({"path": read_file_path}).encode()
             req_fn = lambda: do_read_file_request(  # noqa: E731
-                f"http://{HOST}/read-file", payload, read_file_path
+                f"{BASE_URL}/read-file", payload, read_file_path
             )
         elif mode_name == "--write-file":
             content = b"" if sys.stdin.isatty() else sys.stdin.buffer.read()
@@ -459,7 +462,7 @@ def main():
             }).encode()
             label = ["write-file", write_file_dest]
             req_fn = lambda: do_op_request(  # noqa: E731
-                f"http://{HOST}/write-file", payload, label
+                f"{BASE_URL}/write-file", payload, label
             )
         elif mode_name == "--copy-file":
             upload = load_input_file(json_mode, copy_local)
@@ -472,7 +475,7 @@ def main():
             }).encode()
             label = ["copy-file", copy_local, copy_dest]
             req_fn = lambda: do_op_request(  # noqa: E731
-                f"http://{HOST}/copy-uploaded-file", payload, label
+                f"{BASE_URL}/copy-uploaded-file", payload, label
             )
         elif mode_name == "--search":
             search_body = {
@@ -486,13 +489,13 @@ def main():
             payload = json.dumps(search_body).encode()
             label = ["search", search_root, search_query]
             req_fn = lambda: do_op_request(  # noqa: E731
-                f"http://{HOST}/search-files", payload, label
+                f"{BASE_URL}/search-files", payload, label
             )
         else:  # --list-dir
             payload = json.dumps({"path": list_dir_path}).encode()
             label = ["list-dir", list_dir_path]
             req_fn = lambda: do_op_request(  # noqa: E731
-                f"http://{HOST}/list-dir", payload, label
+                f"{BASE_URL}/list-dir", payload, label
             )
 
         envelope, result = run_with_retries(req_fn, retries, retry_on, json_mode)
@@ -582,7 +585,7 @@ def main():
         if files:
             body["files"] = files
 
-    url = f"http://{HOST}/run"
+    url = f"{BASE_URL}/run"
     payload = json.dumps(body).encode()
 
     max_attempts = 1 + retries

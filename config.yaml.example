@@ -36,6 +36,10 @@
 #       read_prefixes: []
 #       write_prefixes: []
 #     operations: {}              # every read/write/list/search op 404s
+#     limits:                     # optional; each key defaults to the top-level value
+#       max_read_bytes: 1048576
+#       max_write_bytes: 1048576
+#       command_timeout: 10
 #     commands:                   # command surfaces only
 #       inventory: {}
 #       huckctl: {}
@@ -60,6 +64,11 @@ filesystem:
   # When false (default), writing to a path whose final component is a symlink is
   # rejected. Reads/list/search always resolve symlinks before the prefix check.
   allow_symlink_final_target: false
+
+# Seconds each /run command or search may take (default 30). Policies can
+# narrow this per principal via `limits:`; the `commands` registry can override
+# it per command via `timeout:`.
+command_timeout: 30
 
 # Toggle individual operations on/off. A disabled operation returns 404.
 operations:

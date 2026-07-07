@@ -35,7 +35,15 @@ allowlist (`/run`) is only a last line of defense.
 - **Bearer-token auth** — every request requires a token (constant-time comparison).
   Multiple tokens can map to different **principals**, each with its own policy
   (filesystem prefixes, operation toggles, command set) — see [Per-user policies](#per-user-policies).
-- **Timeouts** — 30 seconds per command/search.
+- **Timeouts** — configurable seconds per command/search (`command_timeout`,
+  default 30), optionally narrowed per principal (`limits:`).
+- **Request size cap** — bodies larger than the biggest configured write/upload
+  payload (base64-inflated, plus slack) are rejected up front with 413.
+- **Transport** — the server speaks plain HTTP; the bearer token and all file
+  contents are visible on the wire. Bind to `127.0.0.1` and reach it through an
+  SSH tunnel, Tailscale, or a TLS-terminating reverse proxy — never expose the
+  port directly on an untrusted network. The client accepts a scheme in
+  `EXEC_API_HOST` (e.g. `https://exec.example.com`) for the proxy case.
 - **File uploads** — basename-only validation, 5 MiB per file, 10 MiB total,
   per-request temp dir with guaranteed cleanup.
 - **Stdin limits** — optional UTF-8 stdin forwarding, capped at 256 KiB.
@@ -180,6 +188,9 @@ policies:
   or an explicit narrower value. `commands` references **names from the top-level
   `commands` registry** (executables and the hard denylist are still resolved there,
   once); a policy referencing an unknown or unresolved command is fatal at startup.
+- **Per-policy `limits`** — optional `max_read_bytes` / `max_write_bytes` /
+  `command_timeout`, each defaulting to the top-level value, so a low-trust
+  principal can get smaller caps and a shorter timeout.
 - **Per-command `env`** is merged over the server environment for that command only.
   See the [identity caveat](#allowlist-hazards): this scopes *who is calling*, but the
   CLI must enforce its own identity — args are not filtered.
@@ -199,7 +210,7 @@ The `client/` directory contains a stdlib-only Python client (Python 3, no depen
 
 | Env Var | Default | Purpose |
 |---|---|---|
-| `EXEC_API_HOST` | `127.0.0.1:8019` | Server host:port |
+| `EXEC_API_HOST` | `127.0.0.1:8019` | Server `host:port`, or a full base URL with scheme (`https://exec.example.com`) when behind a TLS proxy |
 | `EXEC_API_TOKEN` | (required) | Bearer token |
 
 ### Usage

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 # The audit trail (policy decisions, /run invocations) is emitted through this
@@ -47,7 +48,7 @@ def _fatal(msg: str) -> None:
 
 
 # --- Limits ---
-COMMAND_TIMEOUT = 30  # seconds
+DEFAULT_COMMAND_TIMEOUT = 30  # seconds
 STDIN_MAX_BYTES = 256 * 1024  # 256 KiB
 SUPPORTED_STDIN_ENCODINGS = frozenset({"utf-8"})
 FILES_MAX_COUNT = 8
@@ -116,12 +117,30 @@ def _resolve_prefixes(raw_list, label: str) -> tuple[Path, ...]:
     return tuple(resolved)
 
 
+def _positive_int(value, label: str) -> int:
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        _fatal(f"{label} must be a positive integer")
+    if value <= 0:
+        _fatal(f"{label} must be a positive integer")
+    return value
+
+
 _FS = CONFIG.get("filesystem") or {}
 READ_PREFIXES: tuple[Path, ...] = _resolve_prefixes(_FS.get("read_prefixes"), "read")
 WRITE_PREFIXES: tuple[Path, ...] = _resolve_prefixes(_FS.get("write_prefixes"), "write")
-MAX_READ_BYTES = int(_FS.get("max_read_bytes", 10 * 1024 * 1024))
-MAX_WRITE_BYTES = int(_FS.get("max_write_bytes", 10 * 1024 * 1024))
+MAX_READ_BYTES = _positive_int(_FS.get("max_read_bytes", 10 * 1024 * 1024), "max_read_bytes")
+MAX_WRITE_BYTES = _positive_int(_FS.get("max_write_bytes", 10 * 1024 * 1024), "max_write_bytes")
 ALLOW_SYMLINK_TARGET = bool(_FS.get("allow_symlink_final_target", False))
+COMMAND_TIMEOUT = _positive_int(
+    CONFIG.get("command_timeout", DEFAULT_COMMAND_TIMEOUT), "command_timeout"
+)
+
+# Process umask, captured once so atomic writes via mkstemp (which forces 0600)
+# can be re-permissioned to the same mode a plain open() would have produced.
+_UMASK = os.umask(0)
+os.umask(_UMASK)
 
 _OPS = CONFIG.get("operations") or {}
 OPERATION_NAMES = ("read_file", "write_file", "copy_uploaded_file", "search_files", "list_dir")
@@ -210,6 +229,9 @@ class Principal:
     operations: dict[str, bool]
     commands: dict[str, str]  # command name -> resolved executable path
     command_env: dict[str, dict[str, str]] = field(default_factory=dict)
+    max_read_bytes: int = 10 * 1024 * 1024
+    max_write_bytes: int = 10 * 1024 * 1024
+    command_timeout: int = DEFAULT_COMMAND_TIMEOUT
 
 
 def _policy_filesystem(name: str, spec) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
@@ -253,6 +275,22 @@ def _policy_commands(name: str, spec) -> tuple[dict[str, str], dict[str, dict[st
     return commands, command_env
 
 
+def _policy_limits(name: str, spec) -> tuple[int, int, int]:
+    """Per-policy caps; each key defaults to the top-level (global) value."""
+    if spec is None or spec == INHERIT:
+        return MAX_READ_BYTES, MAX_WRITE_BYTES, COMMAND_TIMEOUT
+    if not isinstance(spec, dict):
+        _fatal(f"policy '{name}': limits must be a mapping or '{INHERIT}'")
+    return (
+        _positive_int(spec.get("max_read_bytes", MAX_READ_BYTES),
+                      f"policy '{name}': limits.max_read_bytes"),
+        _positive_int(spec.get("max_write_bytes", MAX_WRITE_BYTES),
+                      f"policy '{name}': limits.max_write_bytes"),
+        _positive_int(spec.get("command_timeout", COMMAND_TIMEOUT),
+                      f"policy '{name}': limits.command_timeout"),
+    )
+
+
 def _validate_principal_policy(p: Principal) -> None:
     reads_enabled = any(p.operations[o] for o in ("read_file", "list_dir", "search_files"))
     if reads_enabled and not p.read_prefixes:
@@ -282,6 +320,9 @@ def _build_principals() -> dict[str, Principal]:
             write_prefixes=WRITE_PREFIXES,
             operations=dict(OPERATIONS),
             commands=dict(COMMAND_PATHS),
+            max_read_bytes=MAX_READ_BYTES,
+            max_write_bytes=MAX_WRITE_BYTES,
+            command_timeout=COMMAND_TIMEOUT,
         )
         return {token: owner}
 
@@ -321,6 +362,7 @@ def _build_principals() -> dict[str, Principal]:
         reads, writes = _policy_filesystem(name, policy.get("filesystem"))
         operations = _policy_operations(name, policy.get("operations"))
         commands, command_env = _policy_commands(name, policy.get("commands"))
+        max_read, max_write, cmd_timeout = _policy_limits(name, policy.get("limits"))
         principal = Principal(
             name=name,
             read_prefixes=reads,
@@ -328,6 +370,9 @@ def _build_principals() -> dict[str, Principal]:
             operations=operations,
             commands=commands,
             command_env=command_env,
+            max_read_bytes=max_read,
+            max_write_bytes=max_write,
+            command_timeout=cmd_timeout,
         )
         _validate_principal_policy(principal)
         principals[token] = principal
@@ -338,6 +383,34 @@ def _build_principals() -> dict[str, Principal]:
 PRINCIPALS: dict[str, Principal] = _build_principals()
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+
+# Largest JSON body any endpoint can legitimately need: the biggest configured
+# write/upload payload, base64-inflated (4/3), plus slack for the JSON framing.
+# Without this cap uvicorn would buffer and pydantic would parse arbitrarily
+# large bodies before our own size checks ever run.
+_MAX_CONTENT = max(
+    [MAX_WRITE_BYTES, FILES_TOTAL_MAX_BYTES]
+    + [p.max_write_bytes for p in PRINCIPALS.values()]
+)
+MAX_BODY_BYTES = _MAX_CONTENT * 4 // 3 + 1024 * 1024
+
+
+@app.middleware("http")
+async def _limit_body_size(request, call_next):
+    # Declared-length check only: our client always sends Content-Length, and a
+    # request without one still has every per-field cap applied after parsing.
+    length = request.headers.get("content-length")
+    if length is not None:
+        try:
+            n = int(length)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "invalid Content-Length"})
+        if n > MAX_BODY_BYTES:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": f"request body too large (max {MAX_BODY_BYTES} bytes)"},
+            )
+    return await call_next(request)
 
 
 # --- Request models ---
@@ -529,7 +602,10 @@ def _child_environ() -> dict[str, str]:
 
 # --- Auth + policy ---
 def _check_auth(authorization: str) -> Principal:
-    token = authorization.removeprefix("Bearer ").strip()
+    scheme, _, token = authorization.partition(" ")
+    if scheme != "Bearer":
+        raise HTTPException(status_code=401, detail="unauthorized")
+    token = token.strip()
     # Compare against every principal's token without early-exit so the match is
     # constant-time with respect to which (or whether a) principal matched.
     matched: Principal | None = None
@@ -643,7 +719,14 @@ def _place_file(content: bytes, dest: Path, mode: str, mkdirs: bool) -> bool:
 
     if mode == "append":
         created = not dest.exists()
-        with open(dest, "ab") as fh:
+        # O_NOFOLLOW closes the window between can_write's symlink check and
+        # this open: a link racing into place makes the open fail rather than
+        # silently follow it out of the write prefixes.
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        if not ALLOW_SYMLINK_TARGET:
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(dest, flags, 0o666)
+        with os.fdopen(fd, "ab") as fh:
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
@@ -656,6 +739,9 @@ def _place_file(content: bytes, dest: Path, mode: str, mkdirs: bool) -> bool:
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
+        # mkstemp forces 0600; restore the mode a plain open() would have given
+        # so files written through the API stay readable by other local tools.
+        os.chmod(tmp, 0o666 & ~_UMASK)
         if mode == "create":
             try:
                 os.link(tmp, dest)
@@ -687,10 +773,10 @@ async def read_file(req: ReadFileRequest, authorization: str = Header(default=""
         size = resolved.stat().st_size
     except OSError as exc:
         raise HTTPException(status_code=400, detail=f"stat failed: {exc}") from exc
-    if size > MAX_READ_BYTES:
+    if size > principal.max_read_bytes:
         raise HTTPException(
             status_code=413,
-            detail=f"file too large ({size} bytes, max {MAX_READ_BYTES})",
+            detail=f"file too large ({size} bytes, max {principal.max_read_bytes})",
         )
 
     t0 = time.monotonic()
@@ -725,10 +811,10 @@ async def write_file(req: WriteFileRequest, authorization: str = Header(default=
         content = base64.b64decode(req.content_base64, validate=True) if req.content_base64 else b""
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="invalid base64 content") from exc
-    if len(content) > MAX_WRITE_BYTES:
+    if len(content) > principal.max_write_bytes:
         raise HTTPException(
             status_code=413,
-            detail=f"content too large ({len(content)} bytes, max {MAX_WRITE_BYTES})",
+            detail=f"content too large ({len(content)} bytes, max {principal.max_write_bytes})",
         )
 
     sha = hashlib.sha256(content).hexdigest()
@@ -774,10 +860,13 @@ async def copy_uploaded_file(req: CopyUploadedFileRequest, authorization: str = 
     try:
         src = _resolve_file_ref(req.file, staged_paths)
         content = src.read_bytes()
-        if len(content) > MAX_WRITE_BYTES:
+        if len(content) > principal.max_write_bytes:
             raise HTTPException(
                 status_code=413,
-                detail=f"content too large ({len(content)} bytes, max {MAX_WRITE_BYTES})",
+                detail=(
+                    f"content too large ({len(content)} bytes, "
+                    f"max {principal.max_write_bytes})"
+                ),
             )
         dest = can_write(principal, req.dest, mkdirs=req.mkdirs)
         created = _place_file(content, dest, req.mode, req.mkdirs)
@@ -805,7 +894,7 @@ async def copy_uploaded_file(req: CopyUploadedFileRequest, authorization: str = 
 
 
 async def _search_with_rg(
-    root: Path, req: SearchFilesRequest, max_results: int
+    root: Path, req: SearchFilesRequest, max_results: int, timeout: int
 ) -> tuple[list[dict], bool]:
     args = ["--line-number", "--no-heading", "--color", "never", "--with-filename"]
     if req.ignore_case:
@@ -827,9 +916,7 @@ async def _search_with_rg(
         env=_child_environ(),
     )
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=COMMAND_TIMEOUT
-        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
@@ -865,7 +952,7 @@ async def _search_with_rg(
 
 
 def _search_with_python(
-    root: Path, req: SearchFilesRequest, max_results: int
+    root: Path, req: SearchFilesRequest, max_results: int, timeout: int
 ) -> tuple[list[dict], bool]:
     flags = re.IGNORECASE if req.ignore_case else 0
     if req.fixed_strings:
@@ -876,7 +963,7 @@ def _search_with_python(
         except re.error as exc:
             raise HTTPException(status_code=400, detail=f"invalid query regex: {exc}") from exc
 
-    deadline = time.monotonic() + COMMAND_TIMEOUT
+    deadline = time.monotonic() + timeout
     matches: list[dict] = []
     for dirpath, _dirs, files in os.walk(root):
         for fn in files:
@@ -916,13 +1003,15 @@ async def search_files(req: SearchFilesRequest, authorization: str = Header(defa
 
     t0 = time.monotonic()
     if SEARCH_BINARY:
-        matches, truncated = await _search_with_rg(root, req, max_results)
+        matches, truncated = await _search_with_rg(
+            root, req, max_results, principal.command_timeout
+        )
         engine = "rg"
     else:
         # The walk is blocking; run it off the event loop so one slow search
         # can't stall every other request.
         matches, truncated = await asyncio.to_thread(
-            _search_with_python, root, req, max_results
+            _search_with_python, root, req, max_results, principal.command_timeout
         )
         engine = "python"
     exec_ms = round((time.monotonic() - t0) * 1000)
@@ -1057,7 +1146,7 @@ async def run_command(req: RunRequest, authorization: str = Header(default="")):
             env=child_env,
         )
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=stdin_bytes), timeout=COMMAND_TIMEOUT
+            proc.communicate(input=stdin_bytes), timeout=principal.command_timeout
         )
     except TimeoutError:
         # Kill the whole process group so children spawned by the command
