@@ -8,6 +8,7 @@ line of defense, backed by a hard denylist of code-execution-capable binaries.
 
 import asyncio
 import base64
+import errno
 import fnmatch
 import hashlib
 import hmac
@@ -143,12 +144,17 @@ _UMASK = os.umask(0)
 os.umask(_UMASK)
 
 _OPS = CONFIG.get("operations") or {}
-OPERATION_NAMES = ("read_file", "write_file", "copy_uploaded_file", "search_files", "list_dir")
+OPERATION_NAMES = (
+    "read_file", "write_file", "copy_uploaded_file", "search_files", "list_dir",
+    "delete_file", "move_file",
+)
+READ_OPERATIONS = ("read_file", "list_dir", "search_files")
+WRITE_OPERATIONS = ("write_file", "copy_uploaded_file", "delete_file", "move_file")
 OPERATIONS: dict[str, bool] = {name: bool(_OPS.get(name, False)) for name in OPERATION_NAMES}
 
-if any(OPERATIONS[o] for o in ("read_file", "list_dir", "search_files")) and not READ_PREFIXES:
+if any(OPERATIONS[o] for o in READ_OPERATIONS) and not READ_PREFIXES:
     _fatal("read/list/search operations are enabled but no usable read_prefixes are configured")
-if (OPERATIONS["write_file"] or OPERATIONS["copy_uploaded_file"]) and not WRITE_PREFIXES:
+if any(OPERATIONS[o] for o in WRITE_OPERATIONS) and not WRITE_PREFIXES:
     _fatal("write operations are enabled but no usable write_prefixes are configured")
 
 
@@ -162,8 +168,15 @@ def _is_denied(name_or_path: str) -> bool:
     return base in DENIED_COMMANDS or _VERSION_SUFFIX.sub("", base) in DENIED_COMMANDS
 
 
-def _build_command_paths(commands) -> dict[str, str]:
-    paths: dict[str, str] = {}
+@dataclass(frozen=True)
+class CommandSpec:
+    executable: str
+    timeout: int | None = None  # seconds; None -> the principal's command_timeout
+    cwd: str | None = None  # absolute, existing directory; None -> server cwd
+
+
+def _build_command_registry(commands) -> dict[str, CommandSpec]:
+    registry: dict[str, CommandSpec] = {}
     for name, spec in (commands or {}).items():
         spec = spec or {}
         if not spec.get("allowed", False):
@@ -197,11 +210,19 @@ def _build_command_paths(commands) -> dict[str, str]:
                 file=sys.stderr,
             )
             continue
-        paths[name] = exe
-    return paths
+        timeout = spec.get("timeout")
+        if timeout is not None:
+            timeout = _positive_int(timeout, f"commands.{name}.timeout")
+        cwd = spec.get("cwd")
+        if cwd is not None:
+            cwd = str(cwd)
+            if not (Path(cwd).is_absolute() and Path(cwd).is_dir()):
+                _fatal(f"commands.{name}.cwd must be an absolute path to an existing directory")
+        registry[name] = CommandSpec(executable=exe, timeout=timeout, cwd=cwd)
+    return registry
 
 
-COMMAND_PATHS: dict[str, str] = _build_command_paths(CONFIG.get("commands"))
+COMMAND_REGISTRY: dict[str, CommandSpec] = _build_command_registry(CONFIG.get("commands"))
 
 # Internal search engine (independent of the allowlist). Prefer ripgrep; fall
 # back to a pure-Python walk if rg is unavailable.
@@ -227,7 +248,7 @@ class Principal:
     read_prefixes: tuple[Path, ...]
     write_prefixes: tuple[Path, ...]
     operations: dict[str, bool]
-    commands: dict[str, str]  # command name -> resolved executable path
+    commands: dict[str, CommandSpec]  # command name -> resolved spec
     command_env: dict[str, dict[str, str]] = field(default_factory=dict)
     max_read_bytes: int = 10 * 1024 * 1024
     max_write_bytes: int = 10 * 1024 * 1024
@@ -252,20 +273,20 @@ def _policy_operations(name: str, spec) -> dict[str, bool]:
     return {op: bool(spec.get(op, False)) for op in OPERATION_NAMES}
 
 
-def _policy_commands(name: str, spec) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+def _policy_commands(name: str, spec) -> tuple[dict[str, CommandSpec], dict[str, dict[str, str]]]:
     if spec is None or spec == INHERIT:
-        return dict(COMMAND_PATHS), {}
+        return dict(COMMAND_REGISTRY), {}
     if not isinstance(spec, dict):
         _fatal(f"policy '{name}': commands must be a mapping or '{INHERIT}'")
-    commands: dict[str, str] = {}
+    commands: dict[str, CommandSpec] = {}
     command_env: dict[str, dict[str, str]] = {}
     for cmd, cmd_spec in spec.items():
-        if cmd not in COMMAND_PATHS:
+        if cmd not in COMMAND_REGISTRY:
             _fatal(
                 f"policy '{name}': command '{cmd}' is not an allowed, resolvable entry "
                 "in the top-level `commands` registry"
             )
-        commands[cmd] = COMMAND_PATHS[cmd]
+        commands[cmd] = COMMAND_REGISTRY[cmd]
         cmd_spec = cmd_spec or {}
         env = cmd_spec.get("env") or {}
         if env:
@@ -292,16 +313,15 @@ def _policy_limits(name: str, spec) -> tuple[int, int, int]:
 
 
 def _validate_principal_policy(p: Principal) -> None:
-    reads_enabled = any(p.operations[o] for o in ("read_file", "list_dir", "search_files"))
-    if reads_enabled and not p.read_prefixes:
+    if any(p.operations[o] for o in READ_OPERATIONS) and not p.read_prefixes:
         _fatal(
             f"policy for principal '{p.name}' enables read/list/search but has no usable "
             "read_prefixes"
         )
-    if (p.operations["write_file"] or p.operations["copy_uploaded_file"]) and not p.write_prefixes:
+    if any(p.operations[o] for o in WRITE_OPERATIONS) and not p.write_prefixes:
         _fatal(
-            f"policy for principal '{p.name}' enables write/copy but has no usable "
-            "write_prefixes"
+            f"policy for principal '{p.name}' enables write/copy/delete/move but has no "
+            "usable write_prefixes"
         )
 
 
@@ -319,7 +339,7 @@ def _build_principals() -> dict[str, Principal]:
             read_prefixes=READ_PREFIXES,
             write_prefixes=WRITE_PREFIXES,
             operations=dict(OPERATIONS),
-            commands=dict(COMMAND_PATHS),
+            commands=dict(COMMAND_REGISTRY),
             max_read_bytes=MAX_READ_BYTES,
             max_write_bytes=MAX_WRITE_BYTES,
             command_timeout=COMMAND_TIMEOUT,
@@ -431,6 +451,8 @@ class InputFile(BaseModel):
 
 class ReadFileRequest(BaseModel):
     path: str = Field(min_length=1)
+    offset: int = Field(default=0, ge=0)
+    length: int | None = Field(default=None, gt=0)
 
 
 class WriteFileRequest(BaseModel):
@@ -460,6 +482,17 @@ class SearchFilesRequest(BaseModel):
 
 class ListDirRequest(BaseModel):
     path: str = Field(min_length=1)
+
+
+class DeleteFileRequest(BaseModel):
+    path: str = Field(min_length=1)
+
+
+class MoveFileRequest(BaseModel):
+    src: str = Field(min_length=1)
+    dest: str = Field(min_length=1)
+    mode: str = "create"  # create (409 if dest exists) | overwrite
+    mkdirs: bool = False
 
 
 class RunRequest(BaseModel):
@@ -712,6 +745,39 @@ def can_write(principal: Principal, raw_path: str, *, mkdirs: bool) -> Path:
     return dest
 
 
+def can_remove(principal: Principal, raw_path: str, op: str) -> Path:
+    """Resolve an existing path for deletion or move-out.
+
+    The parent is symlink-resolved but the final component is not, so deleting
+    a symlink removes the link itself — never the target. Both live under the
+    write prefixes: what a principal may create it may also remove.
+    """
+    p = Path(raw_path).expanduser()
+    if not p.is_absolute():
+        raise HTTPException(status_code=400, detail="path must be absolute")
+
+    try:
+        real_parent = p.parent.resolve(strict=True)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="path not found") from None
+    except (OSError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid path: {exc}") from exc
+
+    target = real_parent / p.name
+    allowed = _under_prefixes(target, principal.write_prefixes)
+    logger.info(
+        "policy principal=%s op=%s original=%s resolved=%s decision=%s",
+        principal.name, op, raw_path, target, "allow" if allowed else "deny",
+    )
+    if not allowed:
+        raise HTTPException(status_code=403, detail="path outside allowed write prefixes")
+    if not (target.is_symlink() or target.exists()):
+        raise HTTPException(status_code=404, detail="path not found")
+    if target.is_dir() and not target.is_symlink():
+        raise HTTPException(status_code=400, detail="path is a directory")
+    return target
+
+
 def _place_file(content: bytes, dest: Path, mode: str, mkdirs: bool) -> bool:
     """Write content to dest atomically. Returns True if a new file was created."""
     if mkdirs:
@@ -773,26 +839,41 @@ async def read_file(req: ReadFileRequest, authorization: str = Header(default=""
         size = resolved.stat().st_size
     except OSError as exc:
         raise HTTPException(status_code=400, detail=f"stat failed: {exc}") from exc
-    if size > principal.max_read_bytes:
+
+    # The cap applies to the bytes returned, so ranged reads (offset/length) can
+    # page through a file bigger than max_read_bytes.
+    to_read = max(0, size - req.offset) if req.length is None else req.length
+    if to_read > principal.max_read_bytes:
         raise HTTPException(
             status_code=413,
-            detail=f"file too large ({size} bytes, max {principal.max_read_bytes})",
+            detail=(
+                f"read too large ({to_read} bytes, max {principal.max_read_bytes}); "
+                "use offset/length to page through the file"
+            ),
         )
 
     t0 = time.monotonic()
     try:
-        content = resolved.read_bytes()
+        with open(resolved, "rb") as fh:
+            fh.seek(req.offset)
+            content = fh.read(to_read)
     except OSError as exc:
         raise HTTPException(status_code=400, detail=f"read failed: {exc}") from exc
     exec_ms = round((time.monotonic() - t0) * 1000)
 
     mime, _ = mimetypes.guess_type(resolved.name)
-    logger.info("read_file path=%s size=%s exec_ms=%s", resolved, len(content), exec_ms)
+    logger.info(
+        "read_file path=%s size=%s offset=%s total=%s exec_ms=%s",
+        resolved, len(content), req.offset, size, exec_ms,
+    )
 
     return {
         "name": resolved.name,
         "path": str(resolved),
         "size": len(content),
+        "total_size": size,
+        "offset": req.offset,
+        "eof": req.offset + len(content) >= size,
         "mime": mime,
         "content_base64": base64.b64encode(content).decode("ascii"),
         "exec_ms": exec_ms,
@@ -898,6 +979,110 @@ def _kill_process_group(proc) -> None:
         os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         proc.kill()
+
+
+@app.post("/delete-file")
+async def delete_file(req: DeleteFileRequest, authorization: str = Header(default="")):
+    principal = _check_auth(authorization)
+    _require_operation(principal, "delete_file")
+
+    target = can_remove(principal, req.path, "delete")
+
+    t0 = time.monotonic()
+    try:
+        os.unlink(target)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="path not found") from None
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"delete failed: {exc}") from exc
+    exec_ms = round((time.monotonic() - t0) * 1000)
+
+    logger.info("delete_file path=%s exec_ms=%s", target, exec_ms)
+    return {"path": str(target), "exec_ms": exec_ms}
+
+
+@app.post("/move-file")
+async def move_file(req: MoveFileRequest, authorization: str = Header(default="")):
+    principal = _check_auth(authorization)
+    _require_operation(principal, "move_file")
+
+    if req.mode not in ("create", "overwrite"):
+        raise HTTPException(status_code=400, detail=f"invalid mode: {req.mode}")
+
+    src = can_remove(principal, req.src, "move-src")
+    if src.is_symlink():
+        raise HTTPException(status_code=400, detail="source is a symlink")
+    dest = can_write(principal, req.dest, mkdirs=req.mkdirs)
+
+    t0 = time.monotonic()
+    try:
+        if req.mkdirs:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        if req.mode == "create":
+            # link+unlink is an atomic no-clobber move within a filesystem.
+            try:
+                os.link(src, dest)
+            except FileExistsError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="destination already exists (use mode=overwrite)",
+                ) from exc
+            os.unlink(src)
+        else:
+            os.replace(src, dest)
+    except HTTPException:
+        raise
+    except OSError as exc:
+        if exc.errno == errno.EXDEV:
+            raise HTTPException(
+                status_code=400,
+                detail="src and dest are on different filesystems (not supported)",
+            ) from exc
+        raise HTTPException(status_code=400, detail=f"move failed: {exc}") from exc
+    exec_ms = round((time.monotonic() - t0) * 1000)
+
+    logger.info("move_file src=%s dest=%s mode=%s exec_ms=%s", src, dest, req.mode, exec_ms)
+    return {"src": str(src), "path": str(dest), "exec_ms": exec_ms}
+
+
+@app.get("/healthz")
+async def healthz():
+    # Unauthenticated liveness probe for service monitors; carries no
+    # configuration or policy detail.
+    return {"status": "ok"}
+
+
+@app.get("/capabilities")
+async def capabilities(authorization: str = Header(default="")):
+    """The calling principal's own view of the policy: what it may do here.
+
+    Lets an agent construct valid requests up front instead of discovering the
+    policy by trial and 403.
+    """
+    principal = _check_auth(authorization)
+    return {
+        "principal": principal.name,
+        "operations": dict(principal.operations),
+        "read_prefixes": [str(p) for p in principal.read_prefixes],
+        "write_prefixes": [str(p) for p in principal.write_prefixes],
+        "commands": {
+            name: {
+                "timeout": spec.timeout if spec.timeout is not None
+                else principal.command_timeout,
+                "cwd": spec.cwd,
+            }
+            for name, spec in sorted(principal.commands.items())
+        },
+        "limits": {
+            "max_read_bytes": principal.max_read_bytes,
+            "max_write_bytes": principal.max_write_bytes,
+            "command_timeout": principal.command_timeout,
+            "stdin_max_bytes": STDIN_MAX_BYTES,
+            "file_max_bytes": FILE_MAX_BYTES,
+            "files_total_max_bytes": FILES_TOTAL_MAX_BYTES,
+            "files_max_count": FILES_MAX_COUNT,
+        },
+    }
 
 
 async def _search_with_rg(
@@ -1167,8 +1352,11 @@ async def run_command(req: RunRequest, authorization: str = Header(default="")):
     # on top (e.g. YNAB_PROFILE=emma). Note: env= replaces the environment
     # wholesale, so we must merge rather than pass overrides alone, or
     # PATH/HOME and friends would be lost.
-    abs_path = principal.commands[req.command]
+    spec = principal.commands[req.command]
+    abs_path = spec.executable
     child_env = {**_child_environ(), **principal.command_env.get(req.command, {})}
+    # A per-command timeout (registry) overrides the principal's default.
+    timeout = spec.timeout if spec.timeout is not None else principal.command_timeout
     t0 = time.monotonic()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1179,9 +1367,10 @@ async def run_command(req: RunRequest, authorization: str = Header(default="")):
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             env=child_env,
+            cwd=spec.cwd,
         )
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=stdin_bytes), timeout=principal.command_timeout
+            proc.communicate(input=stdin_bytes), timeout=timeout
         )
     except TimeoutError:
         # Kill the whole process group so children spawned by the command

@@ -244,6 +244,11 @@ echo "more"     | client/exec-api --write-file /allowed/path/out.txt --mode over
 client/exec-api --copy-file ./local.bin /allowed/path/remote.bin
 client/exec-api --search /allowed/path "needle" --ignore-case
 client/exec-api --list-dir /allowed/path
+client/exec-api --delete-file /allowed/path/old.txt
+client/exec-api --move-file /allowed/path/a.txt /allowed/path/b.txt
+
+# What am I allowed to do? (this token's policy view)
+client/exec-api --capabilities
 
 # Structured JSON request on stdin (the agent-friendly path)
 echo '{"command":"echo","argv":["hello"]}' | client/exec-api --json-request
@@ -328,7 +333,11 @@ Returns the contents of a single file as base64. Intended for pulling remote art
 }
 ```
 
-The path is resolved (symlinks followed) and must fall under a `read_prefixes` entry in `config.yaml`. Files larger than `max_read_bytes` are rejected with HTTP 413.
+The path is resolved (symlinks followed) and must fall under a `read_prefixes`
+entry in `config.yaml`. Optional `offset` / `length` fields read a byte range —
+the response carries `total_size`, `offset`, and `eof` so a caller can page
+through a large file. Reads returning more than `max_read_bytes` are rejected
+with HTTP 413.
 
 ### `POST /write-file`
 
@@ -395,3 +404,29 @@ Lists a single directory (non-recursive) under a `read_prefixes` entry.
 **Request:** `{"path": "/allowed/path"}`
 
 **Response:** `{"path", "entries": [{"name", "type", "size", "mtime"}], "truncated", "exec_ms"}`.
+
+### `POST /delete-file`
+
+Deletes a single file (or symlink — the link itself, never its target) under a
+`write_prefixes` entry. Directories are refused.
+
+**Request:** `{"path": "/allowed/path/old.txt"}` — **Response:** `{"path", "exec_ms"}`.
+
+### `POST /move-file`
+
+Renames a file; both `src` and `dest` must be under `write_prefixes`, on the
+same filesystem. `mode` is `create` (default; 409 if `dest` exists, atomically)
+or `overwrite`. A symlink `src` is refused.
+
+**Request:** `{"src": "...", "dest": "...", "mode": "create", "mkdirs": false}` —
+**Response:** `{"src", "path", "exec_ms"}`.
+
+### `GET /capabilities`
+
+Returns the calling principal's own policy view — enabled operations, prefixes,
+command names (with effective timeout/cwd), and limits — so an agent can
+construct valid requests instead of discovering the policy by trial and 403.
+
+### `GET /healthz`
+
+Unauthenticated liveness probe; returns `{"status": "ok"}` and nothing else.

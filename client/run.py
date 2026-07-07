@@ -43,8 +43,8 @@ def build_envelope(*, ok, error_type=None, command=None, exit_code=None,
     return env
 
 
-def _http_post(url, payload, label):
-    """POST a JSON payload. Returns (error_envelope_or_None, result_or_None, elapsed_ms)."""
+def _http_post(url, payload, label, method="POST"):
+    """Send a JSON request. Returns (error_envelope_or_None, result_or_None, elapsed_ms)."""
     req = urllib.request.Request(
         url,
         data=payload,
@@ -52,7 +52,7 @@ def _http_post(url, payload, label):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {TOKEN}",
         },
-        method="POST",
+        method=method,
     )
 
     t0 = time.monotonic()
@@ -126,13 +126,13 @@ def do_read_file_request(url, payload, path):
     return envelope, result
 
 
-def do_op_request(url, payload, label):
+def do_op_request(url, payload, label, method="POST"):
     """Execute one request to a filesystem-operation endpoint.
 
     Returns (envelope_dict, raw_result_or_None). The raw server response is
     attached to the envelope under "result" on success.
     """
-    error, result, elapsed = _http_post(url, payload, label)
+    error, result, elapsed = _http_post(url, payload, label, method=method)
     if error is not None:
         return error, None
 
@@ -279,6 +279,10 @@ def main():
     search_root = None
     search_query = None
     list_dir_path = None
+    delete_file_path = None
+    move_src = None
+    move_dest = None
+    show_capabilities = False
     op_mode = "create"
     mkdirs = False
     glob = None
@@ -347,6 +351,17 @@ def main():
             if not argv:
                 emit_error(json_mode, "--list-dir requires a remote path")
             list_dir_path = argv.pop(0)
+        elif flag == "--delete-file":
+            if not argv:
+                emit_error(json_mode, "--delete-file requires a remote path")
+            delete_file_path = argv.pop(0)
+        elif flag == "--move-file":
+            if len(argv) < 2:
+                emit_error(json_mode, "--move-file requires SRC and DEST remote paths")
+            move_src = argv.pop(0)
+            move_dest = argv.pop(0)
+        elif flag == "--capabilities":
+            show_capabilities = True
         elif flag == "--mode":
             if not argv:
                 emit_error(json_mode, "--mode requires one of: create, overwrite, append")
@@ -376,6 +391,9 @@ def main():
         ("--copy-file", copy_local is not None),
         ("--search", search_root is not None),
         ("--list-dir", list_dir_path is not None),
+        ("--delete-file", delete_file_path is not None),
+        ("--move-file", move_src is not None),
+        ("--capabilities", show_capabilities),
     ]
     active = [name for name, on in fs_modes if on]
     if len(active) > 1:
@@ -436,11 +454,33 @@ def main():
             req_fn = lambda: do_op_request(  # noqa: E731
                 f"{BASE_URL}/search-files", payload, label
             )
-        else:  # --list-dir
+        elif mode_name == "--list-dir":
             payload = json.dumps({"path": list_dir_path}).encode()
             label = ["list-dir", list_dir_path]
             req_fn = lambda: do_op_request(  # noqa: E731
                 f"{BASE_URL}/list-dir", payload, label
+            )
+        elif mode_name == "--delete-file":
+            payload = json.dumps({"path": delete_file_path}).encode()
+            label = ["delete-file", delete_file_path]
+            req_fn = lambda: do_op_request(  # noqa: E731
+                f"{BASE_URL}/delete-file", payload, label
+            )
+        elif mode_name == "--move-file":
+            payload = json.dumps({
+                "src": move_src,
+                "dest": move_dest,
+                "mode": op_mode,
+                "mkdirs": mkdirs,
+            }).encode()
+            label = ["move-file", move_src, move_dest]
+            req_fn = lambda: do_op_request(  # noqa: E731
+                f"{BASE_URL}/move-file", payload, label
+            )
+        else:  # --capabilities
+            label = ["capabilities"]
+            req_fn = lambda: do_op_request(  # noqa: E731
+                f"{BASE_URL}/capabilities", None, label, method="GET"
             )
 
         envelope, result = run_with_retries(req_fn, retries, retry_on, json_mode)
@@ -474,11 +514,17 @@ def main():
                     print(m.get("text", ""))
             if result.get("truncated"):
                 print("(results truncated)", file=sys.stderr)
-        else:  # --list-dir
+        elif mode_name == "--list-dir":
             for e in result.get("entries", []):
                 print(f"{e.get('type', '?')[0]}\t{e.get('size'):>10}\t{e.get('name')}")
             if result.get("truncated"):
                 print("(listing truncated)", file=sys.stderr)
+        elif mode_name == "--delete-file":
+            print(f"deleted {result.get('path')}")
+        elif mode_name == "--move-file":
+            print(f"moved {result.get('src')} -> {result.get('path')}")
+        else:  # --capabilities
+            print(json.dumps(result, indent=2))
         sys.exit(0)
 
     if json_request:
@@ -507,6 +553,7 @@ def main():
                 "[--retry N] [--retry-on transport|any] [--stdin auto|always|never|--no-stdin] "
                 "[--file PATH ...] [--read-file REMOTE_PATH] [--write-file DEST] "
                 "[--copy-file LOCAL DEST] [--search ROOT QUERY] [--list-dir PATH] "
+                "[--delete-file PATH] [--move-file SRC DEST] [--capabilities] "
                 "[--mode create|overwrite|append] [--mkdirs] [--glob PAT] "
                 "[--ignore-case] [--fixed-strings] <command> [args...]",
             )
