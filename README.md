@@ -117,6 +117,17 @@ To update after editing `.env`:
 launchctl kickstart -k gui/$(id -u)/exec-api
 ```
 
+### Linux systemd service
+
+`install-systemd.sh` mirrors the launchd installer as a systemd **user** unit,
+with the same flags and `.env` handling (loaded via `EnvironmentFile`):
+
+```bash
+./install-systemd.sh --host 127.0.0.1 --port 8019
+systemctl --user restart exec-api      # after editing .env
+loginctl enable-linger $USER           # keep it running after logout
+```
+
 ## Configuration
 
 | File / Env Var | Purpose |
