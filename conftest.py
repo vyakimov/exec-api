@@ -1,12 +1,12 @@
 """Test fixtures for exec-api.
 
-server.py builds all of its config/policy state at import time from a config.yaml
-(path overridable via EXEC_API_CONFIG) and the EXEC_API_TOKEN* env vars. To exercise
-different policies — and the startup-fatal paths — each scenario reloads the module
-fresh with its own config and environment.
+server.py exposes create_app(config, environ): each test scenario builds a
+fresh, independent app from a config dict and an env mapping — no module
+reloads, no os.environ mutation for tokens. The module itself is imported once
+against a minimal bootstrap config (import-time `app = create_app()` needs one
+to exist).
 """
 
-import importlib
 import os
 import sys
 
@@ -17,33 +17,33 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+_BOOTSTRAP_CONFIG = {"filesystem": {}, "operations": {}, "commands": {}}
 
-def _clear_token_env():
-    for key in [k for k in os.environ if k.startswith("EXEC_API_TOKEN")]:
-        del os.environ[key]
+
+@pytest.fixture(scope="session")
+def server_module(tmp_path_factory):
+    """Import server once against a bootstrap config; scenarios use create_app."""
+    cfg_path = tmp_path_factory.mktemp("bootstrap") / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump(_BOOTSTRAP_CONFIG))
+    os.environ["EXEC_API_CONFIG"] = str(cfg_path)
+    os.environ.setdefault("EXEC_API_TOKEN", "bootstrap-token")
+    import server
+    return server
 
 
 @pytest.fixture
-def load_server(tmp_path):
-    """Return a function that writes a config and (re)imports server with it.
+def load_server(server_module):
+    """Return a function that builds a fresh app from a config dict and env mapping.
 
-    The function takes a config dict and an env mapping; it raises SystemExit if
-    server's startup validation rejects the config (the _fatal path).
+    Raises SystemExit if startup validation rejects the config (the _fatal
+    path). The new app is installed as server.app so TestClient(server.app)
+    call sites see the scenario's app; per-app state is on server.app.state.exec.
     """
     def _load(config: dict, env: dict):
-        cfg_path = tmp_path / "config.yaml"
-        cfg_path.write_text(yaml.safe_dump(config))
-        _clear_token_env()
-        os.environ["EXEC_API_CONFIG"] = str(cfg_path)
-        os.environ.update(env)
-        sys.modules.pop("server", None)
-        return importlib.import_module("server")
+        server_module.app = server_module.create_app(config, env)
+        return server_module
 
-    yield _load
-
-    sys.modules.pop("server", None)
-    _clear_token_env()
-    os.environ.pop("EXEC_API_CONFIG", None)
+    return _load
 
 
 @pytest.fixture

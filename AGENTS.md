@@ -4,7 +4,7 @@
 
 This repo contains a minimal HTTP server that executes allowlisted commands with bearer-token auth, plus a stdlib-only Python client.
 
-- `server.py` — FastAPI app. Policy-checked filesystem operations (`/read-file`, `/write-file`, `/copy-uploaded-file`, `/search-files`, `/list-dir`) plus an allowlisted-command runner (`/run`).
+- `server.py` — FastAPI app. Policy-checked filesystem operations (`/read-file`, `/write-file`, `/copy-uploaded-file`, `/search-files`, `/list-dir`, `/delete-file`, `/move-file`) plus an allowlisted-command runner (`/run`) and discovery endpoints (`/capabilities`, `/healthz`). Built by `create_app(config, environ)`; config-derived state lives on `app.state.exec` (an `AppState`), and the module-level `app` is the instance uvicorn serves. Tests build independent apps via the factory — see `conftest.py`.
 - `client/run.py` — stdlib-only CLI client with JSON envelope mode, retry with exponential backoff, stdin forwarding, file uploads, and flags for each filesystem operation.
 - `client/exec-api` — shell wrapper for `run.py`.
 

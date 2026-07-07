@@ -54,7 +54,7 @@ def engine(request, env):
         if not HAS_RG:
             pytest.skip("ripgrep not installed")
     else:
-        server.SEARCH_BINARY = None
+        server.app.state.exec.search_binary = None
     return client, read_dir, request.param
 
 
@@ -117,7 +117,7 @@ def test_invalid_regex_400(engine):
 def test_engine_parity(env):
     server, client, read_dir = env
     rg = _search(client, read_dir, ignore_case=True).json()
-    server.SEARCH_BINARY = None
+    server.app.state.exec.search_binary = None
     py = _search(client, read_dir, ignore_case=True).json()
     assert rg["engine"] == "rg" and py["engine"] == "python"
 

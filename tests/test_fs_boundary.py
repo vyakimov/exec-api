@@ -87,7 +87,7 @@ def test_search_root_outside_prefix_denied(env):
 def test_python_search_does_not_read_through_symlinks(env):
     server, client, read_dir, _, outside = env
     os.symlink(outside / "secret.txt", read_dir / "link.txt")
-    server.SEARCH_BINARY = None  # force the fallback engine
+    server.app.state.exec.search_binary = None  # force the fallback engine
     r = client.post("/search-files", json={"root": str(read_dir), "query": "needle"}, headers=H)
     assert r.status_code == 200
     paths = [m["path"] for m in r.json()["matches"]]
