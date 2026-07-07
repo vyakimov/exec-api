@@ -58,7 +58,9 @@ def test_legacy_mode_full_access(load_server, tmp_path, stub_cmd):
     client = TestClient(server.app)
 
     # read a file under the read prefix
-    r = client.post("/read-file", json={"path": f"{read_dir}/hello.txt"}, headers=_bearer("owner-token"))
+    r = client.post(
+        "/read-file", json={"path": f"{read_dir}/hello.txt"}, headers=_bearer("owner-token")
+    )
     assert r.status_code == 200
     assert base64.b64decode(r.json()["content_base64"]) == b"hello world\n"
 
@@ -123,13 +125,16 @@ def test_token_resolves_to_principal(multiuser):
     server, config = multiuser
     client = TestClient(server.app)
 
+    def run_ping(token):
+        return client.post("/run", json={"command": "ping"}, headers=_bearer(token)).status_code
+
     # victor (owner) can run ping; emma (partner) cannot (not in her policy)
-    assert client.post("/run", json={"command": "ping"}, headers=_bearer("victor-token")).status_code == 200
-    assert client.post("/run", json={"command": "ping"}, headers=_bearer("emma-token")).status_code == 403
+    assert run_ping("victor-token") == 200
+    assert run_ping("emma-token") == 403
 
     # unknown and empty tokens are rejected
-    assert client.post("/run", json={"command": "ping"}, headers=_bearer("bogus")).status_code == 401
-    assert client.post("/run", json={"command": "ping"}, headers=_bearer("")).status_code == 401
+    assert run_ping("bogus") == 401
+    assert run_ping("") == 401
 
 
 @pytest.mark.parametrize(
@@ -139,8 +144,10 @@ def test_token_resolves_to_principal(multiuser):
         ("/write-file", {"path": "/tmp/x", "content_base64": ""}),
         ("/list-dir", {"path": "/tmp"}),
         ("/search-files", {"root": "/tmp", "query": "x"}),
-        ("/copy-uploaded-file", {"file": "@file:0", "dest": "/tmp/x",
-                                 "files": [{"name": "a", "content_base64": base64.b64encode(b"a").decode()}]}),
+        ("/copy-uploaded-file", {
+            "file": "@file:0", "dest": "/tmp/x",
+            "files": [{"name": "a", "content_base64": base64.b64encode(b"a").decode()}],
+        }),
     ],
 )
 def test_partner_filesystem_ops_disabled(multiuser, path, body):
@@ -154,11 +161,16 @@ def test_partner_filesystem_ops_disabled(multiuser, path, body):
 def test_partner_command_allow_and_deny(multiuser):
     server, _ = multiuser
     client = TestClient(server.app)
+    def run_as_emma(command):
+        return client.post(
+            "/run", json={"command": command}, headers=_bearer("emma-token")
+        ).status_code
+
     # allowed for partner
-    assert client.post("/run", json={"command": "inventory"}, headers=_bearer("emma-token")).status_code == 200
-    assert client.post("/run", json={"command": "huckctl"}, headers=_bearer("emma-token")).status_code == 200
+    assert run_as_emma("inventory") == 200
+    assert run_as_emma("huckctl") == 200
     # ping is in owner's set but not partner's
-    assert client.post("/run", json={"command": "ping"}, headers=_bearer("emma-token")).status_code == 403
+    assert run_as_emma("ping") == 403
 
 
 def test_env_injection(multiuser):

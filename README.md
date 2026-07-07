@@ -35,7 +35,15 @@ allowlist (`/run`) is only a last line of defense.
 - **Bearer-token auth** — every request requires a token (constant-time comparison).
   Multiple tokens can map to different **principals**, each with its own policy
   (filesystem prefixes, operation toggles, command set) — see [Per-user policies](#per-user-policies).
-- **Timeouts** — 30 seconds per command/search.
+- **Timeouts** — configurable seconds per command/search (`command_timeout`,
+  default 30), optionally narrowed per principal (`limits:`).
+- **Request size cap** — bodies larger than the biggest configured write/upload
+  payload (base64-inflated, plus slack) are rejected up front with 413.
+- **Transport** — the server speaks plain HTTP; the bearer token and all file
+  contents are visible on the wire. Bind to `127.0.0.1` and reach it through an
+  SSH tunnel, Tailscale, or a TLS-terminating reverse proxy — never expose the
+  port directly on an untrusted network. The client accepts a scheme in
+  `EXEC_API_HOST` (e.g. `https://exec.example.com`) for the proxy case.
 - **File uploads** — basename-only validation, 5 MiB per file, 10 MiB total,
   per-request temp dir with guaranteed cleanup.
 - **Stdin limits** — optional UTF-8 stdin forwarding, capped at 256 KiB.
@@ -109,6 +117,17 @@ To update after editing `.env`:
 launchctl kickstart -k gui/$(id -u)/exec-api
 ```
 
+### Linux systemd service
+
+`install-systemd.sh` mirrors the launchd installer as a systemd **user** unit,
+with the same flags and `.env` handling (loaded via `EnvironmentFile`):
+
+```bash
+./install-systemd.sh --host 127.0.0.1 --port 8019
+systemctl --user restart exec-api      # after editing .env
+loginctl enable-linger $USER           # keep it running after logout
+```
+
 ## Configuration
 
 | File / Env Var | Purpose |
@@ -180,6 +199,9 @@ policies:
   or an explicit narrower value. `commands` references **names from the top-level
   `commands` registry** (executables and the hard denylist are still resolved there,
   once); a policy referencing an unknown or unresolved command is fatal at startup.
+- **Per-policy `limits`** — optional `max_read_bytes` / `max_write_bytes` /
+  `command_timeout`, each defaulting to the top-level value, so a low-trust
+  principal can get smaller caps and a shorter timeout.
 - **Per-command `env`** is merged over the server environment for that command only.
   See the [identity caveat](#allowlist-hazards): this scopes *who is calling*, but the
   CLI must enforce its own identity — args are not filtered.
@@ -199,7 +221,7 @@ The `client/` directory contains a stdlib-only Python client (Python 3, no depen
 
 | Env Var | Default | Purpose |
 |---|---|---|
-| `EXEC_API_HOST` | `127.0.0.1:8019` | Server host:port |
+| `EXEC_API_HOST` | `127.0.0.1:8019` | Server `host:port`, or a full base URL with scheme (`https://exec.example.com`) when behind a TLS proxy |
 | `EXEC_API_TOKEN` | (required) | Bearer token |
 
 ### Usage
@@ -214,7 +236,10 @@ client/exec-api --json ls -la
 # Retry on transport errors
 client/exec-api --json --retry 3 echo hello
 
-# Retry on any error (transport + nonzero exit)
+# Retry on any error (transport + nonzero exit).
+# CAUTION: /run is not idempotent — a command that timed out or failed midway may
+# have had side effects, and --retry-on any will run it again. Use only for
+# commands that are safe to repeat.
 client/exec-api --json --retry 3 --retry-on any mycommand
 
 # Pipe stdin
@@ -230,6 +255,11 @@ echo "more"     | client/exec-api --write-file /allowed/path/out.txt --mode over
 client/exec-api --copy-file ./local.bin /allowed/path/remote.bin
 client/exec-api --search /allowed/path "needle" --ignore-case
 client/exec-api --list-dir /allowed/path
+client/exec-api --delete-file /allowed/path/old.txt
+client/exec-api --move-file /allowed/path/a.txt /allowed/path/b.txt
+
+# What am I allowed to do? (this token's policy view)
+client/exec-api --capabilities
 
 # Structured JSON request on stdin (the agent-friendly path)
 echo '{"command":"echo","argv":["hello"]}' | client/exec-api --json-request
@@ -314,7 +344,11 @@ Returns the contents of a single file as base64. Intended for pulling remote art
 }
 ```
 
-The path is resolved (symlinks followed) and must fall under a `read_prefixes` entry in `config.yaml`. Files larger than `max_read_bytes` are rejected with HTTP 413.
+The path is resolved (symlinks followed) and must fall under a `read_prefixes`
+entry in `config.yaml`. Optional `offset` / `length` fields read a byte range —
+the response carries `total_size`, `offset`, and `eof` so a caller can page
+through a large file. Reads returning more than `max_read_bytes` are rejected
+with HTTP 413.
 
 ### `POST /write-file`
 
@@ -362,7 +396,9 @@ using the same write rules as `/write-file`.
 ### `POST /search-files`
 
 Searches under a `read_prefixes` directory (uses `rg` internally; falls back to a
-Python walk). Arbitrary `rg` flags are **not** exposed.
+Python walk). Arbitrary `rg` flags are **not** exposed. Both engines behave the
+same way: hidden and gitignored files are searched, symlinks are never followed,
+and `glob` patterns match file names (not full paths).
 
 **Request:**
 
@@ -379,3 +415,29 @@ Lists a single directory (non-recursive) under a `read_prefixes` entry.
 **Request:** `{"path": "/allowed/path"}`
 
 **Response:** `{"path", "entries": [{"name", "type", "size", "mtime"}], "truncated", "exec_ms"}`.
+
+### `POST /delete-file`
+
+Deletes a single file (or symlink — the link itself, never its target) under a
+`write_prefixes` entry. Directories are refused.
+
+**Request:** `{"path": "/allowed/path/old.txt"}` — **Response:** `{"path", "exec_ms"}`.
+
+### `POST /move-file`
+
+Renames a file; both `src` and `dest` must be under `write_prefixes`, on the
+same filesystem. `mode` is `create` (default; 409 if `dest` exists, atomically)
+or `overwrite`. A symlink `src` is refused.
+
+**Request:** `{"src": "...", "dest": "...", "mode": "create", "mkdirs": false}` —
+**Response:** `{"src", "path", "exec_ms"}`.
+
+### `GET /capabilities`
+
+Returns the calling principal's own policy view — enabled operations, prefixes,
+command names (with effective timeout/cwd), and limits — so an agent can
+construct valid requests instead of discovering the policy by trial and 403.
+
+### `GET /healthz`
+
+Unauthenticated liveness probe; returns `{"status": "ok"}` and nothing else.

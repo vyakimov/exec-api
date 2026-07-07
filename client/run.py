@@ -7,10 +7,13 @@ import os
 import random
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 HOST = os.environ.get("EXEC_API_HOST", "127.0.0.1:8019")
+# EXEC_API_HOST may carry a scheme (e.g. https://exec.example.com behind a
+# TLS-terminating proxy); bare host:port keeps the historical http:// default.
+BASE_URL = HOST.rstrip("/") if "://" in HOST else f"http://{HOST}"
 TOKEN = os.environ.get("EXEC_API_TOKEN", "")
 
 TRANSPORT = "exec-api"
@@ -40,8 +43,8 @@ def build_envelope(*, ok, error_type=None, command=None, exit_code=None,
     return env
 
 
-def do_request(url, payload, command, args):
-    """Execute one HTTP request. Returns (envelope_dict, raw_result_or_None)."""
+def _http_post(url, payload, label, method="POST"):
+    """Send a JSON request. Returns (error_envelope_or_None, result_or_None, elapsed_ms)."""
     req = urllib.request.Request(
         url,
         data=payload,
@@ -49,40 +52,48 @@ def do_request(url, payload, command, args):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {TOKEN}",
         },
-        method="POST",
+        method=method,
     )
 
     t0 = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=35) as resp:
             result = json.loads(resp.read())
-        elapsed = round((time.monotonic() - t0) * 1000)
+        return None, result, round((time.monotonic() - t0) * 1000)
     except urllib.error.HTTPError as e:
         elapsed = round((time.monotonic() - t0) * 1000)
         body = e.read().decode(errors="replace")
         return build_envelope(
             ok=False,
             error_type="request",
-            command=[command] + args,
+            command=label,
             detail=f"HTTP {e.code}: {body}",
             timing_total_ms=elapsed,
-        ), None
+        ), None, elapsed
     except (urllib.error.URLError, OSError) as e:
         elapsed = round((time.monotonic() - t0) * 1000)
         reason = getattr(e, "reason", str(e))
         return build_envelope(
             ok=False,
             error_type="transport",
-            command=[command] + args,
+            command=label,
             detail=f"cannot reach exec API at {HOST}: {reason}",
             timing_total_ms=elapsed,
-        ), None
+        ), None, elapsed
+
+
+def do_request(url, payload, command, args):
+    """Execute one /run request. Returns (envelope_dict, raw_result_or_None)."""
+    label = [command] + args
+    error, result, elapsed = _http_post(url, payload, label)
+    if error is not None:
+        return error, None
 
     cmd_ok = result.get("code", 0) == 0
     return build_envelope(
         ok=cmd_ok,
         error_type=None if cmd_ok else "command",
-        command=[command] + args,
+        command=label,
         exit_code=result.get("code", 0),
         stdout=result.get("stdout", ""),
         stderr=result.get("stderr", ""),
@@ -93,45 +104,14 @@ def do_request(url, payload, command, args):
 
 def do_read_file_request(url, payload, path):
     """Execute one /read-file request. Returns (envelope_dict, raw_result_or_None)."""
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {TOKEN}",
-        },
-        method="POST",
-    )
-
-    t0 = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, timeout=35) as resp:
-            result = json.loads(resp.read())
-        elapsed = round((time.monotonic() - t0) * 1000)
-    except urllib.error.HTTPError as e:
-        elapsed = round((time.monotonic() - t0) * 1000)
-        body = e.read().decode(errors="replace")
-        return build_envelope(
-            ok=False,
-            error_type="request",
-            command=["read-file", path],
-            detail=f"HTTP {e.code}: {body}",
-            timing_total_ms=elapsed,
-        ), None
-    except (urllib.error.URLError, OSError) as e:
-        elapsed = round((time.monotonic() - t0) * 1000)
-        reason = getattr(e, "reason", str(e))
-        return build_envelope(
-            ok=False,
-            error_type="transport",
-            command=["read-file", path],
-            detail=f"cannot reach exec API at {HOST}: {reason}",
-            timing_total_ms=elapsed,
-        ), None
+    label = ["read-file", path]
+    error, result, elapsed = _http_post(url, payload, label)
+    if error is not None:
+        return error, None
 
     envelope = build_envelope(
         ok=True,
-        command=["read-file", path],
+        command=label,
         exit_code=0,
         timing_total_ms=elapsed,
         timing_exec_ms=result.get("exec_ms"),
@@ -146,47 +126,15 @@ def do_read_file_request(url, payload, path):
     return envelope, result
 
 
-def do_op_request(url, payload, label):
+def do_op_request(url, payload, label, method="POST"):
     """Execute one request to a filesystem-operation endpoint.
 
     Returns (envelope_dict, raw_result_or_None). The raw server response is
     attached to the envelope under "result" on success.
     """
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {TOKEN}",
-        },
-        method="POST",
-    )
-
-    t0 = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, timeout=35) as resp:
-            result = json.loads(resp.read())
-        elapsed = round((time.monotonic() - t0) * 1000)
-    except urllib.error.HTTPError as e:
-        elapsed = round((time.monotonic() - t0) * 1000)
-        body = e.read().decode(errors="replace")
-        return build_envelope(
-            ok=False,
-            error_type="request",
-            command=label,
-            detail=f"HTTP {e.code}: {body}",
-            timing_total_ms=elapsed,
-        ), None
-    except (urllib.error.URLError, OSError) as e:
-        elapsed = round((time.monotonic() - t0) * 1000)
-        reason = getattr(e, "reason", str(e))
-        return build_envelope(
-            ok=False,
-            error_type="transport",
-            command=label,
-            detail=f"cannot reach exec API at {HOST}: {reason}",
-            timing_total_ms=elapsed,
-        ), None
+    error, result, elapsed = _http_post(url, payload, label, method=method)
+    if error is not None:
+        return error, None
 
     envelope = build_envelope(
         ok=True,
@@ -204,9 +152,7 @@ def should_retry(envelope, retry_on):
     et = envelope.get("error_type")
     if et == "transport":
         return True
-    if retry_on == "any" and et == "command":
-        return True
-    return False
+    return retry_on == "any" and et == "command"
 
 
 def backoff_sleep(attempt):
@@ -285,7 +231,10 @@ def parse_json_request(json_mode, raw=None):
             if not isinstance(f, dict):
                 emit_error(json_mode, f"--json-request: files[{i}] must be an object")
             if "name" not in f or "content_base64" not in f:
-                emit_error(json_mode, f"--json-request: files[{i}] requires 'name' and 'content_base64'")
+                emit_error(
+                    json_mode,
+                    f"--json-request: files[{i}] requires 'name' and 'content_base64'",
+                )
         body["files"] = files
 
     return command, argv_field, body
@@ -330,6 +279,10 @@ def main():
     search_root = None
     search_query = None
     list_dir_path = None
+    delete_file_path = None
+    move_src = None
+    move_dest = None
+    show_capabilities = False
     op_mode = "create"
     mkdirs = False
     glob = None
@@ -398,6 +351,17 @@ def main():
             if not argv:
                 emit_error(json_mode, "--list-dir requires a remote path")
             list_dir_path = argv.pop(0)
+        elif flag == "--delete-file":
+            if not argv:
+                emit_error(json_mode, "--delete-file requires a remote path")
+            delete_file_path = argv.pop(0)
+        elif flag == "--move-file":
+            if len(argv) < 2:
+                emit_error(json_mode, "--move-file requires SRC and DEST remote paths")
+            move_src = argv.pop(0)
+            move_dest = argv.pop(0)
+        elif flag == "--capabilities":
+            show_capabilities = True
         elif flag == "--mode":
             if not argv:
                 emit_error(json_mode, "--mode requires one of: create, overwrite, append")
@@ -427,6 +391,9 @@ def main():
         ("--copy-file", copy_local is not None),
         ("--search", search_root is not None),
         ("--list-dir", list_dir_path is not None),
+        ("--delete-file", delete_file_path is not None),
+        ("--move-file", move_src is not None),
+        ("--capabilities", show_capabilities),
     ]
     active = [name for name, on in fs_modes if on]
     if len(active) > 1:
@@ -446,7 +413,7 @@ def main():
         if mode_name == "--read-file":
             payload = json.dumps({"path": read_file_path}).encode()
             req_fn = lambda: do_read_file_request(  # noqa: E731
-                f"http://{HOST}/read-file", payload, read_file_path
+                f"{BASE_URL}/read-file", payload, read_file_path
             )
         elif mode_name == "--write-file":
             content = b"" if sys.stdin.isatty() else sys.stdin.buffer.read()
@@ -458,7 +425,7 @@ def main():
             }).encode()
             label = ["write-file", write_file_dest]
             req_fn = lambda: do_op_request(  # noqa: E731
-                f"http://{HOST}/write-file", payload, label
+                f"{BASE_URL}/write-file", payload, label
             )
         elif mode_name == "--copy-file":
             upload = load_input_file(json_mode, copy_local)
@@ -471,7 +438,7 @@ def main():
             }).encode()
             label = ["copy-file", copy_local, copy_dest]
             req_fn = lambda: do_op_request(  # noqa: E731
-                f"http://{HOST}/copy-uploaded-file", payload, label
+                f"{BASE_URL}/copy-uploaded-file", payload, label
             )
         elif mode_name == "--search":
             search_body = {
@@ -485,13 +452,35 @@ def main():
             payload = json.dumps(search_body).encode()
             label = ["search", search_root, search_query]
             req_fn = lambda: do_op_request(  # noqa: E731
-                f"http://{HOST}/search-files", payload, label
+                f"{BASE_URL}/search-files", payload, label
             )
-        else:  # --list-dir
+        elif mode_name == "--list-dir":
             payload = json.dumps({"path": list_dir_path}).encode()
             label = ["list-dir", list_dir_path]
             req_fn = lambda: do_op_request(  # noqa: E731
-                f"http://{HOST}/list-dir", payload, label
+                f"{BASE_URL}/list-dir", payload, label
+            )
+        elif mode_name == "--delete-file":
+            payload = json.dumps({"path": delete_file_path}).encode()
+            label = ["delete-file", delete_file_path]
+            req_fn = lambda: do_op_request(  # noqa: E731
+                f"{BASE_URL}/delete-file", payload, label
+            )
+        elif mode_name == "--move-file":
+            payload = json.dumps({
+                "src": move_src,
+                "dest": move_dest,
+                "mode": op_mode,
+                "mkdirs": mkdirs,
+            }).encode()
+            label = ["move-file", move_src, move_dest]
+            req_fn = lambda: do_op_request(  # noqa: E731
+                f"{BASE_URL}/move-file", payload, label
+            )
+        else:  # --capabilities
+            label = ["capabilities"]
+            req_fn = lambda: do_op_request(  # noqa: E731
+                f"{BASE_URL}/capabilities", None, label, method="GET"
             )
 
         envelope, result = run_with_retries(req_fn, retries, retry_on, json_mode)
@@ -525,11 +514,17 @@ def main():
                     print(m.get("text", ""))
             if result.get("truncated"):
                 print("(results truncated)", file=sys.stderr)
-        else:  # --list-dir
+        elif mode_name == "--list-dir":
             for e in result.get("entries", []):
                 print(f"{e.get('type', '?')[0]}\t{e.get('size'):>10}\t{e.get('name')}")
             if result.get("truncated"):
                 print("(listing truncated)", file=sys.stderr)
+        elif mode_name == "--delete-file":
+            print(f"deleted {result.get('path')}")
+        elif mode_name == "--move-file":
+            print(f"moved {result.get('src')} -> {result.get('path')}")
+        else:  # --capabilities
+            print(json.dumps(result, indent=2))
         sys.exit(0)
 
     if json_request:
@@ -558,6 +553,7 @@ def main():
                 "[--retry N] [--retry-on transport|any] [--stdin auto|always|never|--no-stdin] "
                 "[--file PATH ...] [--read-file REMOTE_PATH] [--write-file DEST] "
                 "[--copy-file LOCAL DEST] [--search ROOT QUERY] [--list-dir PATH] "
+                "[--delete-file PATH] [--move-file SRC DEST] [--capabilities] "
                 "[--mode create|overwrite|append] [--mkdirs] [--glob PAT] "
                 "[--ignore-case] [--fixed-strings] <command> [args...]",
             )
@@ -581,31 +577,14 @@ def main():
         if files:
             body["files"] = files
 
-    url = f"http://{HOST}/run"
+    url = f"{BASE_URL}/run"
     payload = json.dumps(body).encode()
 
-    max_attempts = 1 + retries
-    envelope = None
-    result = None
-
-    for attempt in range(max_attempts):
-        envelope, result = do_request(url, payload, command, args)
-
-        if envelope["ok"] or attempt == max_attempts - 1:
-            break
-
-        if not should_retry(envelope, retry_on):
-            break
-
-        if not json_mode:
-            print(
-                f"retry {attempt + 1}/{retries}: {envelope.get('error_type')} error, retrying...",
-                file=sys.stderr,
-            )
-        backoff_sleep(attempt)
+    envelope, result = run_with_retries(
+        lambda: do_request(url, payload, command, args), retries, retry_on, json_mode
+    )
 
     if json_mode:
-        envelope["attempts"] = attempt + 1
         print(json.dumps(envelope))
         sys.exit(0)
 

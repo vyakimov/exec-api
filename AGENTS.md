@@ -45,7 +45,7 @@ Prefer small, explicit changes. Preserve the service's simplicity.
 
 ## Verification
 
-- Syntax check: `python3 -m py_compile server.py client/run.py`
+- Lint: `ruff check .` (configured in `pyproject.toml`; subsumes a syntax check)
 - Tests: `pip install -r requirements-dev.txt && python3 -m pytest` (covers auth, per-principal policy, command allowlisting, env injection, and startup-fatal misconfigs).
-- The intended deployment host is Grappa (see `.mcp.json`); run end-to-end checks there via the `grappa-remote` MCP tools rather than locally.
+- CI (`.github/workflows/ci.yml`) runs ruff + pytest with a coverage gate on every push.
 - Run locally for a quick check (needs a `config.yaml`): `EXEC_API_TOKEN=test uvicorn server:app --host 127.0.0.1 --port 8019`

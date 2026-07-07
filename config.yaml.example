@@ -36,6 +36,10 @@
 #       read_prefixes: []
 #       write_prefixes: []
 #     operations: {}              # every read/write/list/search op 404s
+#     limits:                     # optional; each key defaults to the top-level value
+#       max_read_bytes: 1048576
+#       max_write_bytes: 1048576
+#       command_timeout: 10
 #     commands:                   # command surfaces only
 #       inventory: {}
 #       huckctl: {}
@@ -61,13 +65,22 @@ filesystem:
   # rejected. Reads/list/search always resolve symlinks before the prefix check.
   allow_symlink_final_target: false
 
+# Seconds each /run command or search may take (default 30). Policies can
+# narrow this per principal via `limits:`; the `commands` registry can override
+# it per command via `timeout:`.
+command_timeout: 30
+
 # Toggle individual operations on/off. A disabled operation returns 404.
+# delete_file / move_file act only under write_prefixes (what a principal may
+# create it may also remove); both default to off.
 operations:
   read_file: true
   write_file: true
   copy_uploaded_file: true
   search_files: true
   list_dir: true
+  delete_file: true
+  move_file: true
 
 # Binary allowlist (last line of defense — NOT the real boundary). Only commands
 # with `allowed: true` can run via /run. `executable` pins an absolute path;
@@ -75,6 +88,9 @@ operations:
 #
 # A built-in hard denylist (osascript, ssh, scp, rsync, find, interpreters, …)
 # is refused even if listed with allowed: true. See README "Allowlist hazards".
+# Each entry may also set:
+#   timeout: <seconds>  — overrides the default command_timeout for this command
+#   cwd: /abs/dir       — working directory for the command (must exist)
 commands:
   luxctl:  { allowed: true, executable: /Users/vy/openclaw/luxctl/luxctl }
   bearctl: { allowed: true, executable: /Users/vy/openclaw/bearctl/bearctl }
