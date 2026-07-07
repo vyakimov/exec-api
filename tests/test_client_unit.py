@@ -44,6 +44,66 @@ def test_base_url_with_scheme(monkeypatch):
     assert mod.BASE_URL == "https://exec.example.com"
 
 
+# --- wrapper-flag splitting ---------------------------------------------------
+
+def _split(client_mod, argv):
+    return client_mod.split_wrapper_args(client_mod.build_parser(), argv)
+
+
+def test_split_stops_at_first_positional(client_mod):
+    wrapper, rest = _split(client_mod, ["--json", "echo", "--json", "-v"])
+    assert wrapper == ["--json"]
+    assert rest == ["echo", "--json", "-v"]  # remote flags pass through untouched
+
+
+def test_split_consumes_flag_values(client_mod):
+    wrapper, rest = _split(client_mod, ["--retry", "3", "echo", "hi"])
+    assert wrapper == ["--retry", "3"]
+    assert rest == ["echo", "hi"]
+
+
+def test_split_consumes_two_value_flags(client_mod):
+    wrapper, rest = _split(client_mod, ["--search", "/root", "query"])
+    assert wrapper == ["--search", "/root", "query"]
+    assert rest == []
+
+
+def test_split_equals_form(client_mod):
+    wrapper, rest = _split(client_mod, ["--retry=3", "echo"])
+    assert wrapper == ["--retry=3"]
+    assert rest == ["echo"]
+
+
+def test_split_double_dash_terminates(client_mod):
+    wrapper, rest = _split(client_mod, ["--json", "--", "--weird-command"])
+    assert wrapper == ["--json"]
+    assert rest == ["--weird-command"]
+
+
+def test_split_unknown_flag_is_usage_error(client_mod, capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        _split(client_mod, ["--bogus", "echo"])
+    assert exc_info.value.code == 1  # plain mode: exit 1
+    assert "unknown flag: --bogus" in capsys.readouterr().err
+
+    # with --json earlier in the wrapper region, the error is an envelope
+    with pytest.raises(SystemExit) as exc_info:
+        _split(client_mod, ["--json", "--bogus", "echo"])
+    assert exc_info.value.code == 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["error_type"] == "usage"
+
+
+def test_parser_errors_respect_json_mode(client_mod, capsys):
+    parser = client_mod.build_parser()
+    parser.json_mode = True
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["--retry", "not-a-number"])
+    assert exc_info.value.code == 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["error_type"] == "usage"
+
+
 # --- retry decisions --------------------------------------------------------
 
 @pytest.mark.parametrize(
