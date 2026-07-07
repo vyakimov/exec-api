@@ -893,10 +893,21 @@ async def copy_uploaded_file(req: CopyUploadedFileRequest, authorization: str = 
     }
 
 
+def _kill_process_group(proc) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
+
+
 async def _search_with_rg(
     root: Path, req: SearchFilesRequest, max_results: int, timeout: int
 ) -> tuple[list[dict], bool]:
     args = ["--line-number", "--no-heading", "--color", "never", "--with-filename"]
+    # Search everything under the root, like the Python fallback: no gitignore
+    # filtering, no hidden-file skipping. Results must not depend on which
+    # engine the host happens to have.
+    args += ["--no-ignore", "--hidden"]
     if req.ignore_case:
         args.append("--ignore-case")
     if req.fixed_strings:
@@ -914,21 +925,51 @@ async def _search_with_rg(
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
         env=_child_environ(),
+        limit=8 * 1024 * 1024,  # stream buffer; single lines beyond this are dropped
     )
+    # Drain stderr concurrently so a chatty rg can't deadlock the stdout reads.
+    stderr_task = asyncio.ensure_future(proc.stderr.read())
+
+    lines: list[str] = []
+    truncated = False
+
+    async def _read_stdout() -> None:
+        # Stream instead of communicate(): stop reading (and kill rg) once we
+        # have enough matches, so a huge tree can't buffer an unbounded result
+        # set in memory.
+        nonlocal truncated
+        while True:
+            try:
+                raw = await proc.stdout.readline()
+            except ValueError:  # single line exceeded the stream limit
+                truncated = True
+                return
+            if not raw:
+                return
+            if len(lines) >= max_results:
+                truncated = True
+                return
+            line = raw.decode(errors="replace").rstrip("\n")
+            if line:
+                lines.append(line)
+
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        await asyncio.wait_for(_read_stdout(), timeout=timeout)
     except TimeoutError:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            proc.kill()
+        _kill_process_group(proc)
         await proc.wait()
+        stderr_task.cancel()
         raise HTTPException(status_code=408, detail="search timed out") from None
+
+    if truncated:
+        _kill_process_group(proc)
+    stderr = await stderr_task
+    await proc.wait()
 
     # rg exits 0 (matches) or 1 (no matches) on success; anything else is an
     # error (e.g. an invalid regex). Surfacing it beats returning a silently
-    # empty result set.
-    if proc.returncode not in (0, 1):
+    # empty result set. A kill after truncation is expected, not an error.
+    if not truncated and proc.returncode not in (0, 1):
         detail = stderr.decode(errors="replace").strip().splitlines()
         raise HTTPException(
             status_code=400,
@@ -936,13 +977,7 @@ async def _search_with_rg(
         )
 
     matches: list[dict] = []
-    truncated = False
-    for line in stdout.decode(errors="replace").splitlines():
-        if not line:
-            continue
-        if len(matches) >= max_results:
-            truncated = True
-            break
+    for line in lines:
         parts = line.split(":", 2)
         if len(parts) == 3 and parts[1].isdigit():
             matches.append({"path": parts[0], "line": int(parts[1]), "text": parts[2]})
@@ -1151,10 +1186,7 @@ async def run_command(req: RunRequest, authorization: str = Header(default="")):
     except TimeoutError:
         # Kill the whole process group so children spawned by the command
         # (e.g. via xargs/make) don't outlive the request.
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            proc.kill()
+        _kill_process_group(proc)
         await proc.wait()
         raise HTTPException(status_code=408, detail="command timed out") from None
     except (FileNotFoundError, NotADirectoryError, PermissionError) as exc:

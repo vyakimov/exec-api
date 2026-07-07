@@ -43,8 +43,8 @@ def build_envelope(*, ok, error_type=None, command=None, exit_code=None,
     return env
 
 
-def do_request(url, payload, command, args):
-    """Execute one HTTP request. Returns (envelope_dict, raw_result_or_None)."""
+def _http_post(url, payload, label):
+    """POST a JSON payload. Returns (error_envelope_or_None, result_or_None, elapsed_ms)."""
     req = urllib.request.Request(
         url,
         data=payload,
@@ -59,33 +59,41 @@ def do_request(url, payload, command, args):
     try:
         with urllib.request.urlopen(req, timeout=35) as resp:
             result = json.loads(resp.read())
-        elapsed = round((time.monotonic() - t0) * 1000)
+        return None, result, round((time.monotonic() - t0) * 1000)
     except urllib.error.HTTPError as e:
         elapsed = round((time.monotonic() - t0) * 1000)
         body = e.read().decode(errors="replace")
         return build_envelope(
             ok=False,
             error_type="request",
-            command=[command] + args,
+            command=label,
             detail=f"HTTP {e.code}: {body}",
             timing_total_ms=elapsed,
-        ), None
+        ), None, elapsed
     except (urllib.error.URLError, OSError) as e:
         elapsed = round((time.monotonic() - t0) * 1000)
         reason = getattr(e, "reason", str(e))
         return build_envelope(
             ok=False,
             error_type="transport",
-            command=[command] + args,
+            command=label,
             detail=f"cannot reach exec API at {HOST}: {reason}",
             timing_total_ms=elapsed,
-        ), None
+        ), None, elapsed
+
+
+def do_request(url, payload, command, args):
+    """Execute one /run request. Returns (envelope_dict, raw_result_or_None)."""
+    label = [command] + args
+    error, result, elapsed = _http_post(url, payload, label)
+    if error is not None:
+        return error, None
 
     cmd_ok = result.get("code", 0) == 0
     return build_envelope(
         ok=cmd_ok,
         error_type=None if cmd_ok else "command",
-        command=[command] + args,
+        command=label,
         exit_code=result.get("code", 0),
         stdout=result.get("stdout", ""),
         stderr=result.get("stderr", ""),
@@ -96,45 +104,14 @@ def do_request(url, payload, command, args):
 
 def do_read_file_request(url, payload, path):
     """Execute one /read-file request. Returns (envelope_dict, raw_result_or_None)."""
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {TOKEN}",
-        },
-        method="POST",
-    )
-
-    t0 = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, timeout=35) as resp:
-            result = json.loads(resp.read())
-        elapsed = round((time.monotonic() - t0) * 1000)
-    except urllib.error.HTTPError as e:
-        elapsed = round((time.monotonic() - t0) * 1000)
-        body = e.read().decode(errors="replace")
-        return build_envelope(
-            ok=False,
-            error_type="request",
-            command=["read-file", path],
-            detail=f"HTTP {e.code}: {body}",
-            timing_total_ms=elapsed,
-        ), None
-    except (urllib.error.URLError, OSError) as e:
-        elapsed = round((time.monotonic() - t0) * 1000)
-        reason = getattr(e, "reason", str(e))
-        return build_envelope(
-            ok=False,
-            error_type="transport",
-            command=["read-file", path],
-            detail=f"cannot reach exec API at {HOST}: {reason}",
-            timing_total_ms=elapsed,
-        ), None
+    label = ["read-file", path]
+    error, result, elapsed = _http_post(url, payload, label)
+    if error is not None:
+        return error, None
 
     envelope = build_envelope(
         ok=True,
-        command=["read-file", path],
+        command=label,
         exit_code=0,
         timing_total_ms=elapsed,
         timing_exec_ms=result.get("exec_ms"),
@@ -155,41 +132,9 @@ def do_op_request(url, payload, label):
     Returns (envelope_dict, raw_result_or_None). The raw server response is
     attached to the envelope under "result" on success.
     """
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {TOKEN}",
-        },
-        method="POST",
-    )
-
-    t0 = time.monotonic()
-    try:
-        with urllib.request.urlopen(req, timeout=35) as resp:
-            result = json.loads(resp.read())
-        elapsed = round((time.monotonic() - t0) * 1000)
-    except urllib.error.HTTPError as e:
-        elapsed = round((time.monotonic() - t0) * 1000)
-        body = e.read().decode(errors="replace")
-        return build_envelope(
-            ok=False,
-            error_type="request",
-            command=label,
-            detail=f"HTTP {e.code}: {body}",
-            timing_total_ms=elapsed,
-        ), None
-    except (urllib.error.URLError, OSError) as e:
-        elapsed = round((time.monotonic() - t0) * 1000)
-        reason = getattr(e, "reason", str(e))
-        return build_envelope(
-            ok=False,
-            error_type="transport",
-            command=label,
-            detail=f"cannot reach exec API at {HOST}: {reason}",
-            timing_total_ms=elapsed,
-        ), None
+    error, result, elapsed = _http_post(url, payload, label)
+    if error is not None:
+        return error, None
 
     envelope = build_envelope(
         ok=True,
@@ -588,28 +533,11 @@ def main():
     url = f"{BASE_URL}/run"
     payload = json.dumps(body).encode()
 
-    max_attempts = 1 + retries
-    envelope = None
-    result = None
-
-    for attempt in range(max_attempts):
-        envelope, result = do_request(url, payload, command, args)
-
-        if envelope["ok"] or attempt == max_attempts - 1:
-            break
-
-        if not should_retry(envelope, retry_on):
-            break
-
-        if not json_mode:
-            print(
-                f"retry {attempt + 1}/{retries}: {envelope.get('error_type')} error, retrying...",
-                file=sys.stderr,
-            )
-        backoff_sleep(attempt)
+    envelope, result = run_with_retries(
+        lambda: do_request(url, payload, command, args), retries, retry_on, json_mode
+    )
 
     if json_mode:
-        envelope["attempts"] = attempt + 1
         print(json.dumps(envelope))
         sys.exit(0)
 

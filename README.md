@@ -376,7 +376,9 @@ using the same write rules as `/write-file`.
 ### `POST /search-files`
 
 Searches under a `read_prefixes` directory (uses `rg` internally; falls back to a
-Python walk). Arbitrary `rg` flags are **not** exposed.
+Python walk). Arbitrary `rg` flags are **not** exposed. Both engines behave the
+same way: hidden and gitignored files are searched, symlinks are never followed,
+and `glob` patterns match file names (not full paths).
 
 **Request:**
 
