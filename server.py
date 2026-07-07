@@ -27,7 +27,18 @@ import yaml
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
+# The audit trail (policy decisions, /run invocations) is emitted through this
+# logger. Uvicorn only configures its own loggers, so without an explicit handler
+# here every INFO record would be dropped by the root logger's WARNING default.
 logger = logging.getLogger("exec-api")
+if not logger.handlers:
+    _log_handler = logging.StreamHandler()
+    _log_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    )
+    logger.addHandler(_log_handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 
 def _fatal(msg: str) -> None:
@@ -122,13 +133,23 @@ if (OPERATIONS["write_file"] or OPERATIONS["copy_uploaded_file"]) and not WRITE_
     _fatal("write operations are enabled but no usable write_prefixes are configured")
 
 
+# Trailing version suffixes ("python3.12", "ruby3.3", "gawk-5") must not dodge
+# the denylist.
+_VERSION_SUFFIX = re.compile(r"[-.]?\d+(\.\d+)*$")
+
+
+def _is_denied(name_or_path: str) -> bool:
+    base = Path(name_or_path).name
+    return base in DENIED_COMMANDS or _VERSION_SUFFIX.sub("", base) in DENIED_COMMANDS
+
+
 def _build_command_paths(commands) -> dict[str, str]:
     paths: dict[str, str] = {}
     for name, spec in (commands or {}).items():
         spec = spec or {}
         if not spec.get("allowed", False):
             continue
-        if name in DENIED_COMMANDS:
+        if _is_denied(name):
             print(
                 f"warning: command '{name}' is on the hard denylist and will not be "
                 "registered, even though config marks it allowed",
@@ -144,10 +165,20 @@ def _build_command_paths(commands) -> dict[str, str]:
             exe = None
         if exe is None:
             exe = shutil.which(name)
-        if exe:
-            paths[name] = exe
-        else:
+        if exe is None:
             print(f"warning: '{name}' not found, will be unavailable", file=sys.stderr)
+            continue
+        # The denylist keys on the config name, but the executable decides what
+        # actually runs: `mypy3: {executable: /usr/bin/python3}` must not slip
+        # through under an innocent alias.
+        if _is_denied(exe):
+            print(
+                f"warning: command '{name}' resolves to denylisted executable "
+                f"'{exe}' and will not be registered",
+                file=sys.stderr,
+            )
+            continue
+        paths[name] = exe
     return paths
 
 
@@ -433,39 +464,42 @@ def stage_input_files(files: list[InputFile]) -> tuple[Path | None, list[Path], 
 def inject_file_args(
     args: list[str], staged_paths: list[Path], temp_dir: Path | None
 ) -> list[str]:
-    if not staged_paths:
-        return args
-
-    replacements_by_index = {
+    replacements = {
         f"{FILE_PLACEHOLDER_PREFIX}{index}": str(path)
         for index, path in enumerate(staged_paths)
     }
-    replacements_by_name = {
-        f"{FILE_PLACEHOLDER_PREFIX}{path.name}": str(path) for path in staged_paths
-    }
+    replacements.update(
+        {f"{FILE_PLACEHOLDER_PREFIX}{path.name}": str(path) for path in staged_paths}
+    )
 
     injected_args: list[str] = []
-    referenced_indices: set[int] = set()
-    referenced_names: set[str] = set()
+    referenced: set[str] = set()
 
     for arg in args:
         if arg == FILESDIR_PLACEHOLDER:
+            if temp_dir is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{FILESDIR_PLACEHOLDER} used but no files were uploaded",
+                )
             injected_args.append(str(temp_dir))
             continue
-        if arg in replacements_by_index:
-            injected_args.append(replacements_by_index[arg])
-            referenced_indices.add(int(arg.removeprefix(FILE_PLACEHOLDER_PREFIX)))
+        if arg in replacements:
+            injected_args.append(replacements[arg])
+            referenced.add(replacements[arg])
             continue
-        if arg in replacements_by_name:
-            injected_args.append(replacements_by_name[arg])
-            referenced_names.add(arg.removeprefix(FILE_PLACEHOLDER_PREFIX))
-            continue
+        if arg.startswith(FILE_PLACEHOLDER_PREFIX):
+            # A placeholder that matches no staged file is a caller error; passing
+            # it through as a literal argument would silently run the command
+            # with garbage.
+            raise HTTPException(
+                status_code=400, detail=f"unknown uploaded-file placeholder: {arg}"
+            )
         injected_args.append(arg)
 
-    for index, path in enumerate(staged_paths):
-        if index in referenced_indices or path.name in referenced_names:
-            continue
-        injected_args.append(str(path))
+    for path in staged_paths:
+        if str(path) not in referenced:
+            injected_args.append(str(path))
 
     return injected_args
 
@@ -481,6 +515,16 @@ def _resolve_file_ref(ref: str, staged_paths: list[Path]) -> Path:
         if path.name == key:
             return path
     raise HTTPException(status_code=404, detail=f"uploaded file not found: {ref}")
+
+
+def _child_environ() -> dict[str, str]:
+    """Server environment minus bearer-token secrets.
+
+    Every EXEC_API_TOKEN* variable is a credential for this API; no child process
+    (allowlisted command or the internal search binary) has any business seeing
+    them.
+    """
+    return {k: v for k, v in os.environ.items() if not k.startswith("EXEC_API_TOKEN")}
 
 
 # --- Auth + policy ---
@@ -631,7 +675,7 @@ def _place_file(content: bytes, dest: Path, mode: str, mkdirs: bool) -> bool:
 
 # --- Endpoints ---
 @app.post("/read-file")
-async def read_file(req: ReadFileRequest, authorization: str = Header()):
+async def read_file(req: ReadFileRequest, authorization: str = Header(default="")):
     principal = _check_auth(authorization)
     _require_operation(principal, "read_file")
 
@@ -670,7 +714,7 @@ async def read_file(req: ReadFileRequest, authorization: str = Header()):
 
 
 @app.post("/write-file")
-async def write_file(req: WriteFileRequest, authorization: str = Header()):
+async def write_file(req: WriteFileRequest, authorization: str = Header(default="")):
     principal = _check_auth(authorization)
     _require_operation(principal, "write_file")
 
@@ -716,7 +760,7 @@ async def write_file(req: WriteFileRequest, authorization: str = Header()):
 
 
 @app.post("/copy-uploaded-file")
-async def copy_uploaded_file(req: CopyUploadedFileRequest, authorization: str = Header()):
+async def copy_uploaded_file(req: CopyUploadedFileRequest, authorization: str = Header(default="")):
     principal = _check_auth(authorization)
     _require_operation(principal, "copy_uploaded_file")
 
@@ -780,9 +824,10 @@ async def _search_with_rg(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        env=_child_environ(),
     )
     try:
-        stdout, _stderr = await asyncio.wait_for(
+        stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=COMMAND_TIMEOUT
         )
     except TimeoutError:
@@ -792,6 +837,16 @@ async def _search_with_rg(
             proc.kill()
         await proc.wait()
         raise HTTPException(status_code=408, detail="search timed out") from None
+
+    # rg exits 0 (matches) or 1 (no matches) on success; anything else is an
+    # error (e.g. an invalid regex). Surfacing it beats returning a silently
+    # empty result set.
+    if proc.returncode not in (0, 1):
+        detail = stderr.decode(errors="replace").strip().splitlines()
+        raise HTTPException(
+            status_code=400,
+            detail=f"search failed: {detail[0] if detail else 'unknown rg error'}",
+        )
 
     matches: list[dict] = []
     truncated = False
@@ -821,15 +876,25 @@ def _search_with_python(
         except re.error as exc:
             raise HTTPException(status_code=400, detail=f"invalid query regex: {exc}") from exc
 
+    deadline = time.monotonic() + COMMAND_TIMEOUT
     matches: list[dict] = []
     for dirpath, _dirs, files in os.walk(root):
         for fn in files:
+            if time.monotonic() > deadline:
+                raise HTTPException(status_code=408, detail="search timed out")
             if req.glob and not fnmatch.fnmatch(fn, req.glob):
                 continue
             fpath = Path(dirpath) / fn
+            # Do not read through symlinks: a link inside a readable prefix must
+            # not leak a target outside it (read_file resolves and re-checks;
+            # this walk cannot, so it skips links — matching rg's behaviour).
+            if fpath.is_symlink():
+                continue
             try:
                 with open(fpath, errors="ignore") as fh:
                     for lineno, line in enumerate(fh, 1):
+                        if lineno % 10000 == 0 and time.monotonic() > deadline:
+                            raise HTTPException(status_code=408, detail="search timed out")
                         if pattern.search(line):
                             if len(matches) >= max_results:
                                 return matches, True
@@ -842,7 +907,7 @@ def _search_with_python(
 
 
 @app.post("/search-files")
-async def search_files(req: SearchFilesRequest, authorization: str = Header()):
+async def search_files(req: SearchFilesRequest, authorization: str = Header(default="")):
     principal = _check_auth(authorization)
     _require_operation(principal, "search_files")
 
@@ -854,7 +919,11 @@ async def search_files(req: SearchFilesRequest, authorization: str = Header()):
         matches, truncated = await _search_with_rg(root, req, max_results)
         engine = "rg"
     else:
-        matches, truncated = _search_with_python(root, req, max_results)
+        # The walk is blocking; run it off the event loop so one slow search
+        # can't stall every other request.
+        matches, truncated = await asyncio.to_thread(
+            _search_with_python, root, req, max_results
+        )
         engine = "python"
     exec_ms = round((time.monotonic() - t0) * 1000)
 
@@ -872,7 +941,7 @@ async def search_files(req: SearchFilesRequest, authorization: str = Header()):
 
 
 @app.post("/list-dir")
-async def list_dir(req: ListDirRequest, authorization: str = Header()):
+async def list_dir(req: ListDirRequest, authorization: str = Header(default="")):
     principal = _check_auth(authorization)
     _require_operation(principal, "list_dir")
 
@@ -925,7 +994,7 @@ async def list_dir(req: ListDirRequest, authorization: str = Header()):
 
 
 @app.post("/run")
-async def run_command(req: RunRequest, authorization: str = Header()):
+async def run_command(req: RunRequest, authorization: str = Header(default="")):
     principal = _check_auth(authorization)
 
     # Allowlist check (scoped to this principal's policy)
@@ -969,12 +1038,13 @@ async def run_command(req: RunRequest, authorization: str = Header()):
 
     injected_args = inject_file_args(req.args, staged_paths, temp_dir)
 
-    # Run the command. The child inherits the server environment with the
-    # principal's per-command overrides layered on top (e.g. YNAB_PROFILE=emma).
-    # Note: env= replaces the environment wholesale, so we must merge rather than
-    # pass overrides alone, or PATH/HOME and friends would be lost.
+    # Run the command. The child inherits the server environment (minus the
+    # bearer-token secrets) with the principal's per-command overrides layered
+    # on top (e.g. YNAB_PROFILE=emma). Note: env= replaces the environment
+    # wholesale, so we must merge rather than pass overrides alone, or
+    # PATH/HOME and friends would be lost.
     abs_path = principal.commands[req.command]
-    child_env = {**os.environ, **principal.command_env.get(req.command, {})}
+    child_env = {**_child_environ(), **principal.command_env.get(req.command, {})}
     t0 = time.monotonic()
     try:
         proc = await asyncio.create_subprocess_exec(
