@@ -21,11 +21,12 @@ import signal
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
@@ -80,29 +81,26 @@ DENIED_COMMANDS = frozenset({
 
 
 # --- Configuration (config.yaml) ---
-# EXEC_API_CONFIG overrides the config path (used by the test suite); defaults to
-# config.yaml next to this file.
+# EXEC_API_CONFIG overrides the config path (used by deployments with the config
+# elsewhere); defaults to config.yaml next to this file.
 CONFIG_PATH = Path(
     os.environ.get("EXEC_API_CONFIG") or Path(__file__).resolve().parent / "config.yaml"
 )
 
 
-def _load_config() -> dict:
-    if not CONFIG_PATH.exists():
+def _load_config(path: Path) -> dict:
+    if not path.exists():
         _fatal(
-            f"config.yaml not found at {CONFIG_PATH}. Copy config.yaml.example "
+            f"config.yaml not found at {path}. Copy config.yaml.example "
             "to config.yaml and edit it."
         )
     try:
-        data = yaml.safe_load(CONFIG_PATH.read_text())
+        data = yaml.safe_load(path.read_text())
     except yaml.YAMLError as exc:
         _fatal(f"config.yaml is not valid YAML: {exc}")
     if not isinstance(data, dict):
         _fatal("config.yaml must be a mapping")
     return data
-
-
-CONFIG: dict = _load_config()
 
 
 def _resolve_prefixes(raw_list, label: str) -> tuple[Path, ...]:
@@ -128,34 +126,17 @@ def _positive_int(value, label: str) -> int:
     return value
 
 
-_FS = CONFIG.get("filesystem") or {}
-READ_PREFIXES: tuple[Path, ...] = _resolve_prefixes(_FS.get("read_prefixes"), "read")
-WRITE_PREFIXES: tuple[Path, ...] = _resolve_prefixes(_FS.get("write_prefixes"), "write")
-MAX_READ_BYTES = _positive_int(_FS.get("max_read_bytes", 10 * 1024 * 1024), "max_read_bytes")
-MAX_WRITE_BYTES = _positive_int(_FS.get("max_write_bytes", 10 * 1024 * 1024), "max_write_bytes")
-ALLOW_SYMLINK_TARGET = bool(_FS.get("allow_symlink_final_target", False))
-COMMAND_TIMEOUT = _positive_int(
-    CONFIG.get("command_timeout", DEFAULT_COMMAND_TIMEOUT), "command_timeout"
-)
-
 # Process umask, captured once so atomic writes via mkstemp (which forces 0600)
 # can be re-permissioned to the same mode a plain open() would have produced.
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-_OPS = CONFIG.get("operations") or {}
 OPERATION_NAMES = (
     "read_file", "write_file", "copy_uploaded_file", "search_files", "list_dir",
     "delete_file", "move_file",
 )
 READ_OPERATIONS = ("read_file", "list_dir", "search_files")
 WRITE_OPERATIONS = ("write_file", "copy_uploaded_file", "delete_file", "move_file")
-OPERATIONS: dict[str, bool] = {name: bool(_OPS.get(name, False)) for name in OPERATION_NAMES}
-
-if any(OPERATIONS[o] for o in READ_OPERATIONS) and not READ_PREFIXES:
-    _fatal("read/list/search operations are enabled but no usable read_prefixes are configured")
-if any(OPERATIONS[o] for o in WRITE_OPERATIONS) and not WRITE_PREFIXES:
-    _fatal("write operations are enabled but no usable write_prefixes are configured")
 
 
 # Trailing version suffixes ("python3.12", "ruby3.3", "gawk-5") must not dodge
@@ -222,15 +203,6 @@ def _build_command_registry(commands) -> dict[str, CommandSpec]:
     return registry
 
 
-COMMAND_REGISTRY: dict[str, CommandSpec] = _build_command_registry(CONFIG.get("commands"))
-
-# Internal search engine (independent of the allowlist). Prefer ripgrep; fall
-# back to a pure-Python walk if rg is unavailable.
-_SEARCH_CFG = CONFIG.get("search_binary")
-SEARCH_BINARY: str | None = (
-    _SEARCH_CFG if (_SEARCH_CFG and Path(_SEARCH_CFG).exists()) else shutil.which("rg")
-)
-
 # --- Principals (token -> identity -> policy) ---
 #
 # Each bearer token maps to a named principal carrying its own policy: filesystem
@@ -255,9 +227,24 @@ class Principal:
     command_timeout: int = DEFAULT_COMMAND_TIMEOUT
 
 
-def _policy_filesystem(name: str, spec) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+@dataclass(frozen=True)
+class _Defaults:
+    """The top-level policy blocks, resolved once; what `inherit_default` reuses."""
+
+    read_prefixes: tuple[Path, ...]
+    write_prefixes: tuple[Path, ...]
+    operations: dict[str, bool]
+    registry: dict[str, CommandSpec]
+    max_read_bytes: int
+    max_write_bytes: int
+    command_timeout: int
+
+
+def _policy_filesystem(
+    name: str, spec, d: _Defaults
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
     if spec is None or spec == INHERIT:
-        return READ_PREFIXES, WRITE_PREFIXES
+        return d.read_prefixes, d.write_prefixes
     if not isinstance(spec, dict):
         _fatal(f"policy '{name}': filesystem must be a mapping or '{INHERIT}'")
     reads = _resolve_prefixes(spec.get("read_prefixes"), f"{name} read")
@@ -265,28 +252,30 @@ def _policy_filesystem(name: str, spec) -> tuple[tuple[Path, ...], tuple[Path, .
     return reads, writes
 
 
-def _policy_operations(name: str, spec) -> dict[str, bool]:
+def _policy_operations(name: str, spec, d: _Defaults) -> dict[str, bool]:
     if spec is None or spec == INHERIT:
-        return dict(OPERATIONS)
+        return dict(d.operations)
     if not isinstance(spec, dict):
         _fatal(f"policy '{name}': operations must be a mapping or '{INHERIT}'")
     return {op: bool(spec.get(op, False)) for op in OPERATION_NAMES}
 
 
-def _policy_commands(name: str, spec) -> tuple[dict[str, CommandSpec], dict[str, dict[str, str]]]:
+def _policy_commands(
+    name: str, spec, d: _Defaults
+) -> tuple[dict[str, CommandSpec], dict[str, dict[str, str]]]:
     if spec is None or spec == INHERIT:
-        return dict(COMMAND_REGISTRY), {}
+        return dict(d.registry), {}
     if not isinstance(spec, dict):
         _fatal(f"policy '{name}': commands must be a mapping or '{INHERIT}'")
     commands: dict[str, CommandSpec] = {}
     command_env: dict[str, dict[str, str]] = {}
     for cmd, cmd_spec in spec.items():
-        if cmd not in COMMAND_REGISTRY:
+        if cmd not in d.registry:
             _fatal(
                 f"policy '{name}': command '{cmd}' is not an allowed, resolvable entry "
                 "in the top-level `commands` registry"
             )
-        commands[cmd] = COMMAND_REGISTRY[cmd]
+        commands[cmd] = d.registry[cmd]
         cmd_spec = cmd_spec or {}
         env = cmd_spec.get("env") or {}
         if env:
@@ -296,18 +285,18 @@ def _policy_commands(name: str, spec) -> tuple[dict[str, CommandSpec], dict[str,
     return commands, command_env
 
 
-def _policy_limits(name: str, spec) -> tuple[int, int, int]:
+def _policy_limits(name: str, spec, d: _Defaults) -> tuple[int, int, int]:
     """Per-policy caps; each key defaults to the top-level (global) value."""
     if spec is None or spec == INHERIT:
-        return MAX_READ_BYTES, MAX_WRITE_BYTES, COMMAND_TIMEOUT
+        return d.max_read_bytes, d.max_write_bytes, d.command_timeout
     if not isinstance(spec, dict):
         _fatal(f"policy '{name}': limits must be a mapping or '{INHERIT}'")
     return (
-        _positive_int(spec.get("max_read_bytes", MAX_READ_BYTES),
+        _positive_int(spec.get("max_read_bytes", d.max_read_bytes),
                       f"policy '{name}': limits.max_read_bytes"),
-        _positive_int(spec.get("max_write_bytes", MAX_WRITE_BYTES),
+        _positive_int(spec.get("max_write_bytes", d.max_write_bytes),
                       f"policy '{name}': limits.max_write_bytes"),
-        _positive_int(spec.get("command_timeout", COMMAND_TIMEOUT),
+        _positive_int(spec.get("command_timeout", d.command_timeout),
                       f"policy '{name}': limits.command_timeout"),
     )
 
@@ -325,24 +314,24 @@ def _validate_principal_policy(p: Principal) -> None:
         )
 
 
-def _build_principals() -> dict[str, Principal]:
-    auth = CONFIG.get("auth")
+def _build_principals(config: dict, environ, d: _Defaults) -> dict[str, Principal]:
+    auth = config.get("auth")
 
     # Legacy mode: no `auth:` section -> single implicit owner from EXEC_API_TOKEN
     # with the top-level (default) policy. Behaviour is identical to before.
     if not auth:
-        token = os.environ.get("EXEC_API_TOKEN", "")
+        token = environ.get("EXEC_API_TOKEN", "")
         if not token:
             _fatal("EXEC_API_TOKEN not set")
         owner = Principal(
             name="owner",
-            read_prefixes=READ_PREFIXES,
-            write_prefixes=WRITE_PREFIXES,
-            operations=dict(OPERATIONS),
-            commands=dict(COMMAND_REGISTRY),
-            max_read_bytes=MAX_READ_BYTES,
-            max_write_bytes=MAX_WRITE_BYTES,
-            command_timeout=COMMAND_TIMEOUT,
+            read_prefixes=d.read_prefixes,
+            write_prefixes=d.write_prefixes,
+            operations=dict(d.operations),
+            commands=dict(d.registry),
+            max_read_bytes=d.max_read_bytes,
+            max_write_bytes=d.max_write_bytes,
+            command_timeout=d.command_timeout,
         )
         return {token: owner}
 
@@ -351,7 +340,7 @@ def _build_principals() -> dict[str, Principal]:
     tokens_cfg = auth.get("tokens")
     if not isinstance(tokens_cfg, dict) or not tokens_cfg:
         _fatal("config.yaml: `auth.tokens` must be a non-empty mapping")
-    policies_cfg = CONFIG.get("policies") or {}
+    policies_cfg = config.get("policies") or {}
     if not isinstance(policies_cfg, dict):
         _fatal("config.yaml: `policies` must be a mapping")
 
@@ -361,7 +350,7 @@ def _build_principals() -> dict[str, Principal]:
         env_name = tok_spec.get("env")
         if not env_name:
             _fatal(f"auth.tokens.{name}: missing `env` (the env var holding the token)")
-        token = os.environ.get(env_name, "")
+        token = environ.get(env_name, "")
         if not token:
             _fatal(f"auth.tokens.{name}: env var {env_name} is not set or empty")
         if token in principals:
@@ -379,10 +368,10 @@ def _build_principals() -> dict[str, Principal]:
         if not isinstance(policy, dict):
             _fatal(f"policies.{policy_name}: must be a mapping")
 
-        reads, writes = _policy_filesystem(name, policy.get("filesystem"))
-        operations = _policy_operations(name, policy.get("operations"))
-        commands, command_env = _policy_commands(name, policy.get("commands"))
-        max_read, max_write, cmd_timeout = _policy_limits(name, policy.get("limits"))
+        reads, writes = _policy_filesystem(name, policy.get("filesystem"), d)
+        operations = _policy_operations(name, policy.get("operations"), d)
+        commands, command_env = _policy_commands(name, policy.get("commands"), d)
+        max_read, max_write, cmd_timeout = _policy_limits(name, policy.get("limits"), d)
         principal = Principal(
             name=name,
             read_prefixes=reads,
@@ -400,35 +389,105 @@ def _build_principals() -> dict[str, Principal]:
     return principals
 
 
-PRINCIPALS: dict[str, Principal] = _build_principals()
+# --- App state (everything derived from one config + environment) ---
+@dataclass
+class AppState:
+    """Config-derived state for one app instance, stored on app.state.exec.
 
-app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    Deliberately mutable: tests swap fields (e.g. search_binary) on a built app.
+    """
 
-# Largest JSON body any endpoint can legitimately need: the biggest configured
-# write/upload payload, base64-inflated (4/3), plus slack for the JSON framing.
-# Without this cap uvicorn would buffer and pydantic would parse arbitrarily
-# large bodies before our own size checks ever run.
-_MAX_CONTENT = max(
-    [MAX_WRITE_BYTES, FILES_TOTAL_MAX_BYTES]
-    + [p.max_write_bytes for p in PRINCIPALS.values()]
-)
-MAX_BODY_BYTES = _MAX_CONTENT * 4 // 3 + 1024 * 1024
+    principals: dict[str, Principal]
+    command_registry: dict[str, CommandSpec]
+    allow_symlink_target: bool
+    search_binary: str | None
+    max_body_bytes: int
 
 
-@app.middleware("http")
+def build_state(config: dict, environ) -> AppState:
+    """Resolve and validate a config into ready-to-serve state.
+
+    Calls _fatal (SystemExit) on any misconfiguration — the server must refuse
+    to start rather than run with a policy it couldn't fully honour.
+    """
+    fs = config.get("filesystem") or {}
+    read_prefixes = _resolve_prefixes(fs.get("read_prefixes"), "read")
+    write_prefixes = _resolve_prefixes(fs.get("write_prefixes"), "write")
+    max_read_bytes = _positive_int(fs.get("max_read_bytes", 10 * 1024 * 1024), "max_read_bytes")
+    max_write_bytes = _positive_int(fs.get("max_write_bytes", 10 * 1024 * 1024), "max_write_bytes")
+    allow_symlink_target = bool(fs.get("allow_symlink_final_target", False))
+    command_timeout = _positive_int(
+        config.get("command_timeout", DEFAULT_COMMAND_TIMEOUT), "command_timeout"
+    )
+
+    ops_cfg = config.get("operations") or {}
+    operations = {name: bool(ops_cfg.get(name, False)) for name in OPERATION_NAMES}
+    if any(operations[o] for o in READ_OPERATIONS) and not read_prefixes:
+        _fatal(
+            "read/list/search operations are enabled but no usable read_prefixes "
+            "are configured"
+        )
+    if any(operations[o] for o in WRITE_OPERATIONS) and not write_prefixes:
+        _fatal("write operations are enabled but no usable write_prefixes are configured")
+
+    registry = _build_command_registry(config.get("commands"))
+
+    # Internal search engine (independent of the allowlist). Prefer ripgrep;
+    # fall back to a pure-Python walk if rg is unavailable.
+    search_cfg = config.get("search_binary")
+    search_binary = (
+        search_cfg if (search_cfg and Path(search_cfg).exists()) else shutil.which("rg")
+    )
+
+    defaults = _Defaults(
+        read_prefixes=read_prefixes,
+        write_prefixes=write_prefixes,
+        operations=operations,
+        registry=registry,
+        max_read_bytes=max_read_bytes,
+        max_write_bytes=max_write_bytes,
+        command_timeout=command_timeout,
+    )
+    principals = _build_principals(config, environ, defaults)
+
+    # Largest JSON body any endpoint can legitimately need: the biggest
+    # configured write/upload payload, base64-inflated (4/3), plus slack for
+    # the JSON framing. Without this cap uvicorn would buffer and pydantic
+    # would parse arbitrarily large bodies before our own size checks ever run.
+    max_content = max(
+        [max_write_bytes, FILES_TOTAL_MAX_BYTES]
+        + [p.max_write_bytes for p in principals.values()]
+    )
+    return AppState(
+        principals=principals,
+        command_registry=registry,
+        allow_symlink_target=allow_symlink_target,
+        search_binary=search_binary,
+        max_body_bytes=max_content * 4 // 3 + 1024 * 1024,
+    )
+
+
+router = APIRouter()
+
+
+def _state(request: Request) -> AppState:
+    return request.app.state.exec
+
+
 async def _limit_body_size(request, call_next):
     # Declared-length check only: our client always sends Content-Length, and a
     # request without one still has every per-field cap applied after parsing.
     length = request.headers.get("content-length")
     if length is not None:
+        max_body = _state(request).max_body_bytes
         try:
             n = int(length)
         except ValueError:
             return JSONResponse(status_code=400, content={"detail": "invalid Content-Length"})
-        if n > MAX_BODY_BYTES:
+        if n > max_body:
             return JSONResponse(
                 status_code=413,
-                content={"detail": f"request body too large (max {MAX_BODY_BYTES} bytes)"},
+                content={"detail": f"request body too large (max {max_body} bytes)"},
             )
     return await call_next(request)
 
@@ -634,7 +693,7 @@ def _child_environ() -> dict[str, str]:
 
 
 # --- Auth + policy ---
-def _check_auth(authorization: str) -> Principal:
+def _check_auth(principals: dict[str, Principal], authorization: str) -> Principal:
     scheme, _, token = authorization.partition(" ")
     if scheme != "Bearer":
         raise HTTPException(status_code=401, detail="unauthorized")
@@ -642,7 +701,7 @@ def _check_auth(authorization: str) -> Principal:
     # Compare against every principal's token without early-exit so the match is
     # constant-time with respect to which (or whether a) principal matched.
     matched: Principal | None = None
-    for tok, principal in PRINCIPALS.items():
+    for tok, principal in principals.items():
         if hmac.compare_digest(token, tok):
             matched = principal
     if matched is None:
@@ -700,7 +759,9 @@ def can_list(principal: Principal, raw_path: str) -> Path:
     return resolved
 
 
-def can_write(principal: Principal, raw_path: str, *, mkdirs: bool) -> Path:
+def can_write(
+    principal: Principal, raw_path: str, *, mkdirs: bool, allow_symlink_target: bool
+) -> Path:
     """Resolve a write destination and enforce the write policy.
 
     Resolves the deepest existing ancestor (following symlinks) so a symlinked
@@ -740,7 +801,7 @@ def can_write(principal: Principal, raw_path: str, *, mkdirs: bool) -> Path:
         raise HTTPException(status_code=403, detail="path outside allowed write prefixes")
     if dest.is_dir():
         raise HTTPException(status_code=400, detail="destination is a directory")
-    if dest.is_symlink() and not ALLOW_SYMLINK_TARGET:
+    if dest.is_symlink() and not allow_symlink_target:
         raise HTTPException(status_code=403, detail="destination is a symlink")
     return dest
 
@@ -778,7 +839,9 @@ def can_remove(principal: Principal, raw_path: str, op: str) -> Path:
     return target
 
 
-def _place_file(content: bytes, dest: Path, mode: str, mkdirs: bool) -> bool:
+def _place_file(
+    content: bytes, dest: Path, mode: str, mkdirs: bool, allow_symlink_target: bool
+) -> bool:
     """Write content to dest atomically. Returns True if a new file was created."""
     if mkdirs:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -789,7 +852,7 @@ def _place_file(content: bytes, dest: Path, mode: str, mkdirs: bool) -> bool:
         # this open: a link racing into place makes the open fail rather than
         # silently follow it out of the write prefixes.
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
-        if not ALLOW_SYMLINK_TARGET:
+        if not allow_symlink_target:
             flags |= getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(dest, flags, 0o666)
         with os.fdopen(fd, "ab") as fh:
@@ -826,9 +889,11 @@ def _place_file(content: bytes, dest: Path, mode: str, mkdirs: bool) -> bool:
 
 
 # --- Endpoints ---
-@app.post("/read-file")
-async def read_file(req: ReadFileRequest, authorization: str = Header(default="")):
-    principal = _check_auth(authorization)
+@router.post("/read-file")
+async def read_file(
+    req: ReadFileRequest, request: Request, authorization: str = Header(default="")
+):
+    principal = _check_auth(_state(request).principals, authorization)
     _require_operation(principal, "read_file")
 
     resolved = can_read(principal, req.path)
@@ -880,9 +945,12 @@ async def read_file(req: ReadFileRequest, authorization: str = Header(default=""
     }
 
 
-@app.post("/write-file")
-async def write_file(req: WriteFileRequest, authorization: str = Header(default="")):
-    principal = _check_auth(authorization)
+@router.post("/write-file")
+async def write_file(
+    req: WriteFileRequest, request: Request, authorization: str = Header(default="")
+):
+    st = _state(request)
+    principal = _check_auth(st.principals, authorization)
     _require_operation(principal, "write_file")
 
     if req.mode not in WRITE_MODES:
@@ -902,11 +970,14 @@ async def write_file(req: WriteFileRequest, authorization: str = Header(default=
     if req.expected_sha256 and req.expected_sha256.lower() != sha:
         raise HTTPException(status_code=400, detail="content sha256 mismatch")
 
-    dest = can_write(principal, req.path, mkdirs=req.mkdirs)
+    dest = can_write(
+        principal, req.path, mkdirs=req.mkdirs,
+        allow_symlink_target=st.allow_symlink_target,
+    )
 
     t0 = time.monotonic()
     try:
-        created = _place_file(content, dest, req.mode, req.mkdirs)
+        created = _place_file(content, dest, req.mode, req.mkdirs, st.allow_symlink_target)
     except HTTPException:
         raise
     except OSError as exc:
@@ -926,9 +997,12 @@ async def write_file(req: WriteFileRequest, authorization: str = Header(default=
     }
 
 
-@app.post("/copy-uploaded-file")
-async def copy_uploaded_file(req: CopyUploadedFileRequest, authorization: str = Header(default="")):
-    principal = _check_auth(authorization)
+@router.post("/copy-uploaded-file")
+async def copy_uploaded_file(
+    req: CopyUploadedFileRequest, request: Request, authorization: str = Header(default="")
+):
+    st = _state(request)
+    principal = _check_auth(st.principals, authorization)
     _require_operation(principal, "copy_uploaded_file")
 
     if req.mode not in WRITE_MODES:
@@ -949,8 +1023,11 @@ async def copy_uploaded_file(req: CopyUploadedFileRequest, authorization: str = 
                     f"max {principal.max_write_bytes})"
                 ),
             )
-        dest = can_write(principal, req.dest, mkdirs=req.mkdirs)
-        created = _place_file(content, dest, req.mode, req.mkdirs)
+        dest = can_write(
+            principal, req.dest, mkdirs=req.mkdirs,
+            allow_symlink_target=st.allow_symlink_target,
+        )
+        created = _place_file(content, dest, req.mode, req.mkdirs, st.allow_symlink_target)
         sha = hashlib.sha256(content).hexdigest()
     except HTTPException:
         raise
@@ -981,9 +1058,11 @@ def _kill_process_group(proc) -> None:
         proc.kill()
 
 
-@app.post("/delete-file")
-async def delete_file(req: DeleteFileRequest, authorization: str = Header(default="")):
-    principal = _check_auth(authorization)
+@router.post("/delete-file")
+async def delete_file(
+    req: DeleteFileRequest, request: Request, authorization: str = Header(default="")
+):
+    principal = _check_auth(_state(request).principals, authorization)
     _require_operation(principal, "delete_file")
 
     target = can_remove(principal, req.path, "delete")
@@ -1001,9 +1080,12 @@ async def delete_file(req: DeleteFileRequest, authorization: str = Header(defaul
     return {"path": str(target), "exec_ms": exec_ms}
 
 
-@app.post("/move-file")
-async def move_file(req: MoveFileRequest, authorization: str = Header(default="")):
-    principal = _check_auth(authorization)
+@router.post("/move-file")
+async def move_file(
+    req: MoveFileRequest, request: Request, authorization: str = Header(default="")
+):
+    st = _state(request)
+    principal = _check_auth(st.principals, authorization)
     _require_operation(principal, "move_file")
 
     if req.mode not in ("create", "overwrite"):
@@ -1012,7 +1094,10 @@ async def move_file(req: MoveFileRequest, authorization: str = Header(default=""
     src = can_remove(principal, req.src, "move-src")
     if src.is_symlink():
         raise HTTPException(status_code=400, detail="source is a symlink")
-    dest = can_write(principal, req.dest, mkdirs=req.mkdirs)
+    dest = can_write(
+        principal, req.dest, mkdirs=req.mkdirs,
+        allow_symlink_target=st.allow_symlink_target,
+    )
 
     t0 = time.monotonic()
     try:
@@ -1045,21 +1130,21 @@ async def move_file(req: MoveFileRequest, authorization: str = Header(default=""
     return {"src": str(src), "path": str(dest), "exec_ms": exec_ms}
 
 
-@app.get("/healthz")
+@router.get("/healthz")
 async def healthz():
     # Unauthenticated liveness probe for service monitors; carries no
     # configuration or policy detail.
     return {"status": "ok"}
 
 
-@app.get("/capabilities")
-async def capabilities(authorization: str = Header(default="")):
+@router.get("/capabilities")
+async def capabilities(request: Request, authorization: str = Header(default="")):
     """The calling principal's own view of the policy: what it may do here.
 
     Lets an agent construct valid requests up front instead of discovering the
     policy by trial and 403.
     """
-    principal = _check_auth(authorization)
+    principal = _check_auth(_state(request).principals, authorization)
     return {
         "principal": principal.name,
         "operations": dict(principal.operations),
@@ -1086,7 +1171,7 @@ async def capabilities(authorization: str = Header(default="")):
 
 
 async def _search_with_rg(
-    root: Path, req: SearchFilesRequest, max_results: int, timeout: int
+    search_binary: str, root: Path, req: SearchFilesRequest, max_results: int, timeout: int
 ) -> tuple[list[dict], bool]:
     args = ["--line-number", "--no-heading", "--color", "never", "--with-filename"]
     # Search everything under the root, like the Python fallback: no gitignore
@@ -1104,7 +1189,7 @@ async def _search_with_rg(
     args += ["--", req.query, str(root)]
 
     proc = await asyncio.create_subprocess_exec(
-        SEARCH_BINARY,
+        search_binary,
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -1213,18 +1298,21 @@ def _search_with_python(
     return matches, False
 
 
-@app.post("/search-files")
-async def search_files(req: SearchFilesRequest, authorization: str = Header(default="")):
-    principal = _check_auth(authorization)
+@router.post("/search-files")
+async def search_files(
+    req: SearchFilesRequest, request: Request, authorization: str = Header(default="")
+):
+    st = _state(request)
+    principal = _check_auth(st.principals, authorization)
     _require_operation(principal, "search_files")
 
     root = can_list(principal, req.root)
     max_results = max(1, min(req.max_results, SEARCH_MAX_MATCHES))
 
     t0 = time.monotonic()
-    if SEARCH_BINARY:
+    if st.search_binary:
         matches, truncated = await _search_with_rg(
-            root, req, max_results, principal.command_timeout
+            st.search_binary, root, req, max_results, principal.command_timeout
         )
         engine = "rg"
     else:
@@ -1249,9 +1337,11 @@ async def search_files(req: SearchFilesRequest, authorization: str = Header(defa
     }
 
 
-@app.post("/list-dir")
-async def list_dir(req: ListDirRequest, authorization: str = Header(default="")):
-    principal = _check_auth(authorization)
+@router.post("/list-dir")
+async def list_dir(
+    req: ListDirRequest, request: Request, authorization: str = Header(default="")
+):
+    principal = _check_auth(_state(request).principals, authorization)
     _require_operation(principal, "list_dir")
 
     target = can_list(principal, req.path)
@@ -1302,9 +1392,11 @@ async def list_dir(req: ListDirRequest, authorization: str = Header(default=""))
     }
 
 
-@app.post("/run")
-async def run_command(req: RunRequest, authorization: str = Header(default="")):
-    principal = _check_auth(authorization)
+@router.post("/run")
+async def run_command(
+    req: RunRequest, request: Request, authorization: str = Header(default="")
+):
+    principal = _check_auth(_state(request).principals, authorization)
 
     # Allowlist check (scoped to this principal's policy)
     if req.command not in principal.commands:
@@ -1425,3 +1517,27 @@ async def run_command(req: RunRequest, authorization: str = Header(default="")):
         "code": proc.returncode,
         "exec_ms": exec_ms,
     }
+
+
+# --- App factory ---
+def create_app(config: dict | None = None, environ: Mapping[str, str] | None = None) -> FastAPI:
+    """Build a fully configured, independent app instance.
+
+    `config` defaults to the contents of CONFIG_PATH; `environ` (where bearer
+    tokens are looked up) defaults to os.environ. Raises SystemExit via _fatal
+    on any misconfiguration, so a bad config can never serve requests.
+    """
+    if config is None:
+        config = _load_config(CONFIG_PATH)
+    if environ is None:
+        environ = os.environ
+    application = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    application.state.exec = build_state(config, environ)
+    application.middleware("http")(_limit_body_size)
+    application.include_router(router)
+    return application
+
+
+# The instance uvicorn serves (`uvicorn server:app`). Import fails fast on a
+# missing or invalid config — production behaviour is unchanged by the factory.
+app = create_app()

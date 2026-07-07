@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """CLI client for exec-api. No dependencies beyond stdlib."""
 
+import argparse
 import base64
 import json
 import os
@@ -262,126 +263,120 @@ def run_with_retries(request_fn, retries, retry_on, json_mode):
     return envelope, result
 
 
-def main():
-    # Parse wrapper flags before the command name
-    argv = sys.argv[1:]
-    json_mode = False
-    json_request = False
-    json_request_file = None
-    retries = 0
-    retry_on = "transport"
-    stdin_mode = "auto"
-    files = []
-    read_file_path = None
-    write_file_dest = None
-    copy_local = None
-    copy_dest = None
-    search_root = None
-    search_query = None
-    list_dir_path = None
-    delete_file_path = None
-    move_src = None
-    move_dest = None
-    show_capabilities = False
-    op_mode = "create"
-    mkdirs = False
-    glob = None
-    ignore_case = False
-    fixed_strings = False
+class _Parser(argparse.ArgumentParser):
+    """ArgumentParser whose errors go through emit_error.
 
-    while argv and argv[0].startswith("--"):
-        flag = argv.pop(0)
-        if flag == "--json":
-            json_mode = True
-        elif flag == "--json-request":
-            json_request = True
-            json_mode = True  # --json-request implies --json
-        elif flag == "--json-request-file":
-            if not argv:
-                emit_error(json_mode, "--json-request-file requires a path")
-            json_request_file = argv.pop(0)
-            json_request = True
-            json_mode = True
-        elif flag == "--retry":
-            if not argv:
-                emit_error(json_mode, "--retry requires a number")
-            try:
-                retries = int(argv.pop(0))
-            except ValueError:
-                emit_error(json_mode, "--retry requires a number")
-            if retries < 0 or retries > MAX_RETRIES:
-                emit_error(json_mode, f"--retry must be 0-{MAX_RETRIES}")
-        elif flag == "--retry-on":
-            if not argv:
-                emit_error(json_mode, f"--retry-on requires one of: {', '.join(RETRY_ON_CHOICES)}")
-            retry_on = argv.pop(0)
-            if retry_on not in RETRY_ON_CHOICES:
-                emit_error(json_mode, f"--retry-on must be one of: {', '.join(RETRY_ON_CHOICES)}")
-        elif flag == "--stdin":
-            if not argv:
-                emit_error(json_mode, f"--stdin requires one of: {', '.join(STDIN_MODE_CHOICES)}")
-            stdin_mode = argv.pop(0)
-            if stdin_mode not in STDIN_MODE_CHOICES:
-                emit_error(json_mode, f"--stdin must be one of: {', '.join(STDIN_MODE_CHOICES)}")
-        elif flag == "--no-stdin":
-            stdin_mode = "never"
-        elif flag == "--file":
-            if not argv:
-                emit_error(json_mode, "--file requires a local path")
-            files.append(load_input_file(json_mode, argv.pop(0)))
-        elif flag == "--read-file":
-            if not argv:
-                emit_error(json_mode, "--read-file requires a remote path")
-            read_file_path = argv.pop(0)
-        elif flag == "--write-file":
-            if not argv:
-                emit_error(json_mode, "--write-file requires a remote dest path")
-            write_file_dest = argv.pop(0)
-        elif flag == "--copy-file":
-            if len(argv) < 2:
-                emit_error(json_mode, "--copy-file requires LOCAL and DEST paths")
-            copy_local = argv.pop(0)
-            copy_dest = argv.pop(0)
-        elif flag == "--search":
-            if len(argv) < 2:
-                emit_error(json_mode, "--search requires REMOTE_ROOT and QUERY")
-            search_root = argv.pop(0)
-            search_query = argv.pop(0)
-        elif flag == "--list-dir":
-            if not argv:
-                emit_error(json_mode, "--list-dir requires a remote path")
-            list_dir_path = argv.pop(0)
-        elif flag == "--delete-file":
-            if not argv:
-                emit_error(json_mode, "--delete-file requires a remote path")
-            delete_file_path = argv.pop(0)
-        elif flag == "--move-file":
-            if len(argv) < 2:
-                emit_error(json_mode, "--move-file requires SRC and DEST remote paths")
-            move_src = argv.pop(0)
-            move_dest = argv.pop(0)
-        elif flag == "--capabilities":
-            show_capabilities = True
-        elif flag == "--mode":
-            if not argv:
-                emit_error(json_mode, "--mode requires one of: create, overwrite, append")
-            op_mode = argv.pop(0)
-            if op_mode not in ("create", "overwrite", "append"):
-                emit_error(json_mode, "--mode must be one of: create, overwrite, append")
-        elif flag == "--mkdirs":
-            mkdirs = True
-        elif flag == "--glob":
-            if not argv:
-                emit_error(json_mode, "--glob requires a pattern")
-            glob = argv.pop(0)
-        elif flag == "--ignore-case":
-            ignore_case = True
-        elif flag == "--fixed-strings":
-            fixed_strings = True
-        elif flag == "--":
-            break
-        else:
-            emit_error(json_mode, f"unknown flag: {flag}")
+    In --json mode a usage error must still print a JSON envelope and exit 0;
+    argparse's default (usage text on stderr, exit 2) would break the "one
+    parser, always an envelope" contract.
+    """
+
+    json_mode = False
+
+    def error(self, message):
+        emit_error(self.json_mode, message)
+
+
+def build_parser():
+    parser = _Parser(
+        prog="exec-api",
+        description="CLI client for exec-api: run allowlisted remote commands "
+                    "and policy-checked filesystem operations.",
+    )
+    parser.add_argument("--json", action="store_true",
+                        help="emit a JSON envelope (always exits 0)")
+    parser.add_argument("--json-request", action="store_true",
+                        help="read a structured JSON request from stdin (implies --json)")
+    parser.add_argument("--json-request-file", metavar="PATH",
+                        help="read a structured JSON request from a file (implies --json)")
+    parser.add_argument("--retry", type=int, default=0, metavar="N",
+                        help=f"retry attempts, 0-{MAX_RETRIES}")
+    parser.add_argument("--retry-on", choices=RETRY_ON_CHOICES, default="transport",
+                        help="which errors to retry")
+    parser.add_argument("--stdin", choices=STDIN_MODE_CHOICES, default="auto",
+                        dest="stdin_mode", help="when to forward local stdin")
+    parser.add_argument("--no-stdin", action="store_const", const="never",
+                        dest="stdin_mode", help="never forward local stdin")
+    parser.add_argument("--file", action="append", default=[], dest="file_paths",
+                        metavar="PATH", help="upload a local file (repeatable)")
+    parser.add_argument("--read-file", metavar="REMOTE_PATH")
+    parser.add_argument("--write-file", metavar="DEST")
+    parser.add_argument("--copy-file", nargs=2, metavar=("LOCAL", "DEST"))
+    parser.add_argument("--search", nargs=2, metavar=("ROOT", "QUERY"))
+    parser.add_argument("--list-dir", metavar="PATH")
+    parser.add_argument("--delete-file", metavar="PATH")
+    parser.add_argument("--move-file", nargs=2, metavar=("SRC", "DEST"))
+    parser.add_argument("--capabilities", action="store_true",
+                        help="show this token's policy view")
+    parser.add_argument("--mode", choices=("create", "overwrite", "append"),
+                        default="create", dest="op_mode")
+    parser.add_argument("--mkdirs", action="store_true")
+    parser.add_argument("--glob", metavar="PAT")
+    parser.add_argument("--ignore-case", action="store_true")
+    parser.add_argument("--fixed-strings", action="store_true")
+    return parser
+
+
+_JSON_FLAGS = ("--json", "--json-request", "--json-request-file")
+
+
+def split_wrapper_args(parser, argv):
+    """Split argv into (wrapper flags, remote command+args).
+
+    Wrapper flags end at the first token that is not a recognized --flag (or
+    at a literal `--`); everything after passes to the remote command
+    untouched, even if it looks like a flag. This is the contract that lets
+    `exec-api mycmd --verbose` forward --verbose instead of eating it.
+    """
+    value_counts = {}
+    for action in parser._actions:
+        for opt in action.option_strings:
+            n = action.nargs
+            value_counts[opt] = 0 if n == 0 else (n if isinstance(n, int) else 1)
+
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            return argv[:i], argv[i + 1:]
+        if not tok.startswith("--"):
+            return argv[:i], argv[i:]
+        base, eq, _ = tok.partition("=")
+        if base not in value_counts:
+            json_hint = any(t.partition("=")[0] in _JSON_FLAGS for t in argv[:i])
+            emit_error(json_hint, f"unknown flag: {tok}")
+        i += 1 if eq else 1 + value_counts[base]
+    return argv, []
+
+
+def main():
+    parser = build_parser()
+    wrapper, argv = split_wrapper_args(parser, sys.argv[1:])
+    parser.json_mode = any(t.partition("=")[0] in _JSON_FLAGS for t in wrapper)
+    ns = parser.parse_args(wrapper)
+
+    json_request = ns.json_request or ns.json_request_file is not None
+    json_mode = ns.json or json_request
+    json_request_file = ns.json_request_file
+    if ns.retry < 0 or ns.retry > MAX_RETRIES:
+        emit_error(json_mode, f"--retry must be 0-{MAX_RETRIES}")
+    retries = ns.retry
+    retry_on = ns.retry_on
+    stdin_mode = ns.stdin_mode
+    files = [load_input_file(json_mode, path) for path in ns.file_paths]
+    read_file_path = ns.read_file
+    write_file_dest = ns.write_file
+    copy_local, copy_dest = ns.copy_file or (None, None)
+    search_root, search_query = ns.search or (None, None)
+    list_dir_path = ns.list_dir
+    delete_file_path = ns.delete_file
+    move_src, move_dest = ns.move_file or (None, None)
+    show_capabilities = ns.capabilities
+    op_mode = ns.op_mode
+    mkdirs = ns.mkdirs
+    glob = ns.glob
+    ignore_case = ns.ignore_case
+    fixed_strings = ns.fixed_strings
 
     # --- Filesystem operation modes (mutually exclusive with each other, with
     # --json-request, and with positional command/args) ---

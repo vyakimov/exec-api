@@ -224,7 +224,7 @@ def test_per_command_cwd(env):
 
 def test_body_size_cap(env):
     server, client, _ = env
-    blob = b'{"command": "' + b"A" * server.MAX_BODY_BYTES + b'"}'
+    blob = b'{"command": "' + b"A" * server.app.state.exec.max_body_bytes + b'"}'
     r = client.post(
         "/run", content=blob,
         headers={**H, "Content-Type": "application/json"},
@@ -266,6 +266,7 @@ def test_denylisted_executable_alias_not_registered(load_server, tmp_path, echo_
         },
     }
     server = load_server(config, {"EXEC_API_TOKEN": "tok"})
-    assert "ok" in server.COMMAND_REGISTRY
-    assert "sneaky" not in server.COMMAND_REGISTRY
-    assert "bash" not in server.COMMAND_REGISTRY
+    registry = server.app.state.exec.command_registry
+    assert "ok" in registry
+    assert "sneaky" not in registry
+    assert "bash" not in registry
