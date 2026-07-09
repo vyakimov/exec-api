@@ -906,13 +906,13 @@ def _place_file(
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
         if not allow_symlink_target:
             flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(dest, flags, file_permissions or 0o666)
+        fd = os.open(dest, flags, file_permissions if file_permissions is not None else 0o666)
         with os.fdopen(fd, "ab") as fh:
+            if file_permissions is not None:
+                os.fchmod(fh.fileno(), file_permissions)
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
-        if not created and file_permissions is not None:
-            os.chmod(dest, file_permissions)
         return created
 
     fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=".exec-api-tmp-")

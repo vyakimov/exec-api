@@ -113,6 +113,64 @@ def test_write_file_accepts_explicit_permissions(env):
     assert (target.stat().st_mode & 0o777) == 0o700
 
 
+def test_append_create_honors_explicit_permissions_under_restrictive_umask(env):
+    _, client, write_dir = env
+    target = write_dir / "append-tool"
+    old_umask = os.umask(0o077)
+    try:
+        r = client.post(
+            "/write-file",
+            json={
+                "path": str(target),
+                "content_base64": _b64(b"tool"),
+                "mode": "append",
+                "permissions": "0755",
+            },
+            headers=H,
+        )
+    finally:
+        os.umask(old_umask)
+    assert r.status_code == 200
+    assert (target.stat().st_mode & 0o777) == 0o755
+
+
+def test_append_create_honors_zero_permissions(env):
+    _, client, write_dir = env
+    target = write_dir / "append-private"
+    r = client.post(
+        "/write-file",
+        json={
+            "path": str(target),
+            "content_base64": _b64(b"private"),
+            "mode": "append",
+            "permissions": "0000",
+        },
+        headers=H,
+    )
+    assert r.status_code == 200
+    assert (target.stat().st_mode & 0o777) == 0o000
+
+
+def test_append_existing_file_applies_explicit_permissions(env):
+    _, client, write_dir = env
+    target = write_dir / "append-existing"
+    target.write_text("old")
+    target.chmod(0o644)
+    r = client.post(
+        "/write-file",
+        json={
+            "path": str(target),
+            "content_base64": _b64(b"new"),
+            "mode": "append",
+            "permissions": "0600",
+        },
+        headers=H,
+    )
+    assert r.status_code == 200
+    assert (target.stat().st_mode & 0o777) == 0o600
+    assert target.read_bytes() == b"oldnew"
+
+
 def test_append_accumulates_and_creates(env):
     _, client, write_dir = env
     body = {"path": f"{write_dir}/log.txt", "content_base64": _b64(b"a"), "mode": "append"}
