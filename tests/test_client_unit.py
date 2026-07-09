@@ -228,6 +228,7 @@ def test_load_input_file_roundtrip(client_mod, tmp_path):
     assert upload["name"] == "data.bin"
     import base64
     assert base64.b64decode(upload["content_base64"]) == b"\x00\x01binary"
+    assert upload["permissions"] == f"{f.stat().st_mode & 0o777:04o}"
 
 
 def test_load_input_file_missing(client_mod, capsys):

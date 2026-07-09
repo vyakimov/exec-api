@@ -175,6 +175,10 @@ def load_input_file(json_mode, file_path):
     if not os.path.isfile(file_path):
         emit_error(json_mode, f"file not found: {file_path}")
     try:
+        permissions = os.stat(file_path).st_mode & 0o777
+    except OSError as exc:
+        emit_error(json_mode, f"failed to stat file '{file_path}': {exc}")
+    try:
         with open(file_path, "rb") as fh:
             content = fh.read()
     except OSError as exc:
@@ -187,6 +191,7 @@ def load_input_file(json_mode, file_path):
     return {
         "name": os.path.basename(file_path),
         "content_base64": base64.b64encode(content).decode("ascii"),
+        "permissions": f"{permissions:04o}",
     }
 
 
@@ -311,6 +316,10 @@ def build_parser():
     parser.add_argument("--mode", choices=("create", "overwrite", "append"),
                         default="create", dest="op_mode")
     parser.add_argument("--mkdirs", action="store_true")
+    parser.add_argument("--permissions", metavar="MODE",
+                        help="octal permissions for --write-file/--copy-file, e.g. 0755")
+    parser.add_argument("--executable", action="store_true",
+                        help="make --write-file/--copy-file executable")
     parser.add_argument("--glob", metavar="PAT")
     parser.add_argument("--ignore-case", action="store_true")
     parser.add_argument("--fixed-strings", action="store_true")
@@ -374,6 +383,8 @@ def main():
     show_capabilities = ns.capabilities
     op_mode = ns.op_mode
     mkdirs = ns.mkdirs
+    permissions = ns.permissions
+    executable = ns.executable
     glob = ns.glob
     ignore_case = ns.ignore_case
     fixed_strings = ns.fixed_strings
@@ -417,6 +428,8 @@ def main():
                 "content_base64": base64.b64encode(content).decode(),
                 "mode": op_mode,
                 "mkdirs": mkdirs,
+                "permissions": permissions,
+                "executable": executable,
             }).encode()
             label = ["write-file", write_file_dest]
             req_fn = lambda: do_op_request(  # noqa: E731
@@ -429,6 +442,8 @@ def main():
                 "dest": copy_dest,
                 "mode": op_mode,
                 "mkdirs": mkdirs,
+                "permissions": permissions,
+                "executable": executable,
                 "files": [upload],
             }).encode()
             label = ["copy-file", copy_local, copy_dest]

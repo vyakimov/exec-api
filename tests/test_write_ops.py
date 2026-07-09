@@ -64,6 +64,55 @@ def test_overwrite_replaces(env):
     assert (write_dir / "f.txt").read_bytes() == b"new"
 
 
+def test_overwrite_preserves_existing_file_mode(env):
+    _, client, write_dir = env
+    target = write_dir / "tool"
+    target.write_text("old")
+    target.chmod(0o755)
+    r = client.post(
+        "/write-file",
+        json={"path": str(target), "content_base64": _b64(b"new"), "mode": "overwrite"},
+        headers=H,
+    )
+    assert r.status_code == 200
+    assert (target.stat().st_mode & 0o777) == 0o755
+    assert r.json()["permissions"] == "0755"
+
+
+def test_write_file_can_create_executable(env):
+    _, client, write_dir = env
+    target = write_dir / "script.sh"
+    r = client.post(
+        "/write-file",
+        json={
+            "path": str(target),
+            "content_base64": _b64(b"#!/bin/sh\necho hi\n"),
+            "executable": True,
+        },
+        headers=H,
+    )
+    assert r.status_code == 200
+    permissions = target.stat().st_mode & 0o777
+    assert permissions & 0o100
+    assert r.json()["permissions"] == f"{permissions:04o}"
+
+
+def test_write_file_accepts_explicit_permissions(env):
+    _, client, write_dir = env
+    target = write_dir / "private.sh"
+    r = client.post(
+        "/write-file",
+        json={
+            "path": str(target),
+            "content_base64": _b64(b"#!/bin/sh\n"),
+            "permissions": "0700",
+        },
+        headers=H,
+    )
+    assert r.status_code == 200
+    assert (target.stat().st_mode & 0o777) == 0o700
+
+
 def test_append_accumulates_and_creates(env):
     _, client, write_dir = env
     body = {"path": f"{write_dir}/log.txt", "content_base64": _b64(b"a"), "mode": "append"}
@@ -166,6 +215,27 @@ def test_copy_uploaded_file_places_content(env):
         headers=H,
     )
     assert r.status_code == 404
+
+
+def test_copy_uploaded_file_preserves_uploaded_permissions(env):
+    _, client, write_dir = env
+    target = write_dir / "uploaded-tool"
+    r = client.post(
+        "/copy-uploaded-file",
+        json={
+            "file": "@file:0",
+            "dest": str(target),
+            "files": [{
+                "name": "uploaded-tool",
+                "content_base64": _b64(b"#!/bin/sh\necho hi\n"),
+                "permissions": "0755",
+            }],
+        },
+        headers=H,
+    )
+    assert r.status_code == 200
+    assert (target.stat().st_mode & 0o777) == 0o755
+    assert r.json()["permissions"] == "0755"
 
 
 def test_delete_file(env):

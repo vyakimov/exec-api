@@ -131,6 +131,33 @@ def _positive_int(value, label: str) -> int:
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
+
+def _default_file_permissions() -> int:
+    return 0o666 & ~_UMASK
+
+
+def _parse_permissions(value: str | None, *, field: str = "permissions") -> int | None:
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if text.startswith("0o"):
+        text = text[2:]
+    if not re.fullmatch(r"[0-7]{3,4}", text):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} must be octal file permissions like 0644 or 0755",
+        )
+    bits = int(text, 8)
+    if bits & ~0o777:
+        raise HTTPException(status_code=400, detail=f"{field} must not include special bits")
+    return bits
+
+
+def _with_executable_bits(permissions: int) -> int:
+    # Mirror read permissions to execute permissions, like a typical script
+    # install, and ensure the owner can execute even for private write-only files.
+    return permissions | ((permissions & 0o444) >> 2) | 0o100
+
 OPERATION_NAMES = (
     "read_file", "write_file", "copy_uploaded_file", "search_files", "list_dir",
     "delete_file", "move_file",
@@ -496,6 +523,7 @@ async def _limit_body_size(request, call_next):
 class InputFile(BaseModel):
     name: str = Field(min_length=1, max_length=FILENAME_MAX_CHARS)
     content_base64: str = Field(min_length=1)
+    permissions: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -520,6 +548,8 @@ class WriteFileRequest(BaseModel):
     mode: str = "create"
     mkdirs: bool = False
     expected_sha256: str | None = None
+    permissions: str | None = None
+    executable: bool = False
 
 
 class CopyUploadedFileRequest(BaseModel):
@@ -527,6 +557,8 @@ class CopyUploadedFileRequest(BaseModel):
     dest: str = Field(min_length=1)
     mode: str = "create"
     mkdirs: bool = False
+    permissions: str | None = None
+    executable: bool = False
     files: list[InputFile] = Field(default_factory=list, max_length=FILES_MAX_COUNT)
 
 
@@ -615,6 +647,11 @@ def stage_input_files(files: list[InputFile]) -> tuple[Path | None, list[Path], 
             target_path = temp_dir / upload.name
             with target_path.open("xb") as fh:
                 fh.write(content)
+            upload_permissions = _parse_permissions(
+                upload.permissions, field=f"permissions for file '{upload.name}'"
+            )
+            if upload_permissions is not None:
+                target_path.chmod(upload_permissions)
             staged_paths.append(target_path)
     except Exception as exc:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -840,7 +877,13 @@ def can_remove(principal: Principal, raw_path: str, op: str) -> Path:
 
 
 def _place_file(
-    content: bytes, dest: Path, mode: str, mkdirs: bool, allow_symlink_target: bool
+    content: bytes,
+    dest: Path,
+    mode: str,
+    mkdirs: bool,
+    allow_symlink_target: bool,
+    requested_permissions: int | None = None,
+    executable: bool = False,
 ) -> bool:
     """Write content to dest atomically. Returns True if a new file was created."""
     if mkdirs:
@@ -848,17 +891,28 @@ def _place_file(
 
     if mode == "append":
         created = not dest.exists()
+        file_permissions = requested_permissions
+        if file_permissions is None and (created or executable):
+            file_permissions = (
+                _default_file_permissions()
+                if created
+                else os.stat(dest, follow_symlinks=False).st_mode & 0o777
+            )
+        if file_permissions is not None and executable:
+            file_permissions = _with_executable_bits(file_permissions)
         # O_NOFOLLOW closes the window between can_write's symlink check and
         # this open: a link racing into place makes the open fail rather than
         # silently follow it out of the write prefixes.
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
         if not allow_symlink_target:
             flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(dest, flags, 0o666)
+        fd = os.open(dest, flags, file_permissions or 0o666)
         with os.fdopen(fd, "ab") as fh:
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
+        if not created and file_permissions is not None:
+            os.chmod(dest, file_permissions)
         return created
 
     fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=".exec-api-tmp-")
@@ -868,9 +922,18 @@ def _place_file(
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
-        # mkstemp forces 0600; restore the mode a plain open() would have given
-        # so files written through the API stay readable by other local tools.
-        os.chmod(tmp, 0o666 & ~_UMASK)
+        existed = dest.exists()
+        if requested_permissions is not None:
+            file_permissions = requested_permissions
+        elif existed and mode == "overwrite":
+            file_permissions = os.stat(dest, follow_symlinks=False).st_mode & 0o777
+        else:
+            file_permissions = _default_file_permissions()
+        if executable:
+            file_permissions = _with_executable_bits(file_permissions)
+        # mkstemp forces 0600; restore the target mode before the atomic link or
+        # replace. Overwrites preserve the existing file mode unless overridden.
+        os.chmod(tmp, file_permissions)
         if mode == "create":
             try:
                 os.link(tmp, dest)
@@ -880,7 +943,6 @@ def _place_file(
                     detail="destination already exists (use mode=overwrite)",
                 ) from exc
             return True
-        existed = dest.exists()
         os.replace(tmp, dest)
         return not existed
     finally:
@@ -974,10 +1036,19 @@ async def write_file(
         principal, req.path, mkdirs=req.mkdirs,
         allow_symlink_target=st.allow_symlink_target,
     )
+    requested_permissions = _parse_permissions(req.permissions)
 
     t0 = time.monotonic()
     try:
-        created = _place_file(content, dest, req.mode, req.mkdirs, st.allow_symlink_target)
+        created = _place_file(
+            content,
+            dest,
+            req.mode,
+            req.mkdirs,
+            st.allow_symlink_target,
+            requested_permissions,
+            req.executable,
+        )
     except HTTPException:
         raise
     except OSError as exc:
@@ -993,6 +1064,7 @@ async def write_file(
         "size": len(content),
         "sha256": sha,
         "created": created,
+        "permissions": f"{dest.stat().st_mode & 0o777:04o}",
         "exec_ms": exec_ms,
     }
 
@@ -1027,7 +1099,22 @@ async def copy_uploaded_file(
             principal, req.dest, mkdirs=req.mkdirs,
             allow_symlink_target=st.allow_symlink_target,
         )
-        created = _place_file(content, dest, req.mode, req.mkdirs, st.allow_symlink_target)
+        requested_permissions = _parse_permissions(req.permissions)
+        if requested_permissions is None:
+            src_index = staged_paths.index(src)
+            requested_permissions = _parse_permissions(
+                req.files[src_index].permissions,
+                field=f"permissions for file '{req.files[src_index].name}'",
+            )
+        created = _place_file(
+            content,
+            dest,
+            req.mode,
+            req.mkdirs,
+            st.allow_symlink_target,
+            requested_permissions,
+            req.executable,
+        )
         sha = hashlib.sha256(content).hexdigest()
     except HTTPException:
         raise
@@ -1047,6 +1134,7 @@ async def copy_uploaded_file(
         "size": len(content),
         "sha256": sha,
         "created": created,
+        "permissions": f"{dest.stat().st_mode & 0o777:04o}",
         "exec_ms": exec_ms,
     }
 

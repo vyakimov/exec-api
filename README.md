@@ -252,6 +252,7 @@ client/exec-api --json --file ./data.csv mycommand @file:data.csv
 client/exec-api --read-file /allowed/path/file.txt > local.txt
 echo "contents" | client/exec-api --write-file /allowed/path/out.txt   # create (default)
 echo "more"     | client/exec-api --write-file /allowed/path/out.txt --mode overwrite
+echo "script"   | client/exec-api --write-file /allowed/path/tool --executable
 client/exec-api --copy-file ./local.bin /allowed/path/remote.bin
 client/exec-api --search /allowed/path "needle" --ignore-case
 client/exec-api --list-dir /allowed/path
@@ -362,7 +363,9 @@ Writes a small file atomically under a `write_prefixes` entry.
   "content_base64": "...",
   "mode": "create",
   "mkdirs": false,
-  "expected_sha256": "optional"
+  "expected_sha256": "optional",
+  "permissions": "optional octal mode, e.g. 0755",
+  "executable": false
 }
 ```
 
@@ -371,8 +374,11 @@ Writes a small file atomically under a `write_prefixes` entry.
 existing ancestor is symlink-resolved); a symlinked final target is rejected
 unless `allow_symlink_final_target` is set. Content over `max_write_bytes` → 413.
 If `expected_sha256` is supplied and does not match the content hash → 400.
+By default, overwriting an existing file preserves its permission bits. New files
+use regular file permissions from the process umask. Set `executable` to add
+execute bits or `permissions` to request exact octal permission bits.
 
-**Response:** `{"path", "size", "sha256", "created", "exec_ms"}`.
+**Response:** `{"path", "size", "sha256", "created", "permissions", "exec_ms"}`.
 
 ### `POST /copy-uploaded-file`
 
@@ -386,12 +392,16 @@ using the same write rules as `/write-file`.
   "file": "@file:0",
   "dest": "/Users/vy/Downloads/foo.bin",
   "mode": "create",
-  "files": [{"name": "foo.bin", "content_base64": "..."}]
+  "permissions": "optional octal mode, e.g. 0755",
+  "executable": false,
+  "files": [{"name": "foo.bin", "content_base64": "...", "permissions": "0644"}]
 }
 ```
 
 `file` references one staged upload by `@file:<index>` / `@file:<name>` (or bare
-`0` / name). **Response:** `{"path", "size", "sha256", "created", "exec_ms"}`.
+`0` / name). Uploaded file permissions are preserved when supplied; the stdlib
+client includes them for `--copy-file` and `--file` uploads. **Response:**
+`{"path", "size", "sha256", "created", "permissions", "exec_ms"}`.
 
 ### `POST /search-files`
 
