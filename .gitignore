@@ -9,3 +9,4 @@ logs/
 .env
 config.yaml
 .mcp.json
+uv.lock
