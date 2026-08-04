@@ -79,6 +79,21 @@ def test_missing_and_malformed_auth(env):
     ).status_code == 401
 
 
+def test_default_command_timeout_is_90_seconds(load_server, tmp_path, echo_stub):
+    config = {
+        "filesystem": {
+            "read_prefixes": [str(tmp_path)],
+            "write_prefixes": [str(tmp_path)],
+        },
+        "operations": dict.fromkeys(ALL_OPS, True),
+        "commands": {"echo-stub": {"allowed": True, "executable": echo_stub}},
+    }
+    server = load_server(config, {"EXEC_API_TOKEN": "tok"})
+
+    principal = next(iter(server.app.state.exec.principals.values()))
+    assert principal.command_timeout == 90
+
+
 def test_unknown_command_403(env):
     _, client, _ = env
     r = client.post("/run", json={"command": "nope"}, headers=H)

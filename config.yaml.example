@@ -65,10 +65,10 @@ filesystem:
   # rejected. Reads/list/search always resolve symlinks before the prefix check.
   allow_symlink_final_target: false
 
-# Seconds each /run command or search may take (default 30). Policies can
+# Seconds each /run command or search may take (default 90). Policies can
 # narrow this per principal via `limits:`; the `commands` registry can override
 # it per command via `timeout:`.
-command_timeout: 30
+command_timeout: 90
 
 # Toggle individual operations on/off. A disabled operation returns 404.
 # delete_file / move_file act only under write_prefixes (what a principal may
@@ -106,6 +106,7 @@ commands:
   ping: { allowed: true }
   inventory: { allowed: true }   # referenced by the `partner` policy example above
   ynab: { allowed: true }        # referenced by the `partner` policy example above
+  vault-spider: { allowed: true, executable: /Users/vy/Documents/Development/vault-spider/bin/vault-spider }
 
   # Superseded by policy-aware operations. Listed here for documentation; the
   # `replacement` field is informational only.

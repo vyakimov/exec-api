@@ -36,7 +36,7 @@ allowlist (`/run`) is only a last line of defense.
   Multiple tokens can map to different **principals**, each with its own policy
   (filesystem prefixes, operation toggles, command set) — see [Per-user policies](#per-user-policies).
 - **Timeouts** — configurable seconds per command/search (`command_timeout`,
-  default 30), optionally narrowed per principal (`limits:`).
+  default 90), optionally narrowed per principal (`limits:`).
 - **Request size cap** — bodies larger than the biggest configured write/upload
   payload (base64-inflated, plus slack) are rejected up front with 413.
 - **Transport** — the server speaks plain HTTP; the bearer token and all file

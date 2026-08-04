@@ -49,3 +49,8 @@ Prefer small, explicit changes. Preserve the service's simplicity.
 - Tests: `pip install -r requirements-dev.txt && python3 -m pytest` (covers auth, per-principal policy, command allowlisting, env injection, and startup-fatal misconfigs).
 - CI (`.github/workflows/ci.yml`) runs ruff + pytest with a coverage gate on every push.
 - Run locally for a quick check (needs a `config.yaml`): `EXEC_API_TOKEN=test uvicorn server:app --host 127.0.0.1 --port 8019`
+
+## Service Management
+
+- The production service used by Grappa is the launchd job `ai.openclaw.exec-api`, bound to `10.0.2.1:8019`. After changing `config.yaml`, always restart it with `launchctl kickstart -k gui/$(id -u)/ai.openclaw.exec-api`.
+- Do not restart or install the generic `exec-api` launchd job; its plist binds to `127.0.0.1` and is not the service Grappa uses.

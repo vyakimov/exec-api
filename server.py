@@ -50,7 +50,7 @@ def _fatal(msg: str) -> None:
 
 
 # --- Limits ---
-DEFAULT_COMMAND_TIMEOUT = 30  # seconds
+DEFAULT_COMMAND_TIMEOUT = 90  # seconds
 STDIN_MAX_BYTES = 256 * 1024  # 256 KiB
 SUPPORTED_STDIN_ENCODINGS = frozenset({"utf-8"})
 FILES_MAX_COUNT = 8
